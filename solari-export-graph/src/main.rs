@@ -3,6 +3,7 @@ use std::{path::PathBuf, sync::Arc};
 use clap::Parser;
 use solari_spatial::SphereIndexVec;
 use solari_transfers::{TransferGraph, fast_paths::FastGraphVec};
+use tracing::info;
 use tracing_subscriber::FmtSubscriber;
 
 #[derive(Parser)]
@@ -18,11 +19,20 @@ fn main() -> Result<(), anyhow::Error> {
         .expect("setting tracing default failed");
 
     let args = Args::parse();
+    info!(
+        valhalla_tiles = %args.valhalla_tiles.display(),
+        output = %args.output.display(),
+        "starting solari transfer graph export"
+    );
+    info!("opening output database");
     let database = Arc::new(redb::Database::create(
         args.output.join("graph_metadata.db"),
     )?);
+    info!("building transfer graph from valhalla tiles");
     let transfer_graph =
         TransferGraph::<FastGraphVec, SphereIndexVec<usize>>::new(&args.valhalla_tiles, database)?;
+    info!("saving transfer graph artifacts");
     transfer_graph.save_to_dir(args.output)?;
+    info!("transfer graph export complete");
     Ok(())
 }

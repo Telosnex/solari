@@ -38,6 +38,10 @@ impl<G: FastGraph, I: SphereIndex<usize>> TransferGraph<G, I> {
         valhalla_tile_dir: &PathBuf,
         database: Arc<Database>,
     ) -> Result<TransferGraph<FastGraphVec, SphereIndexVec<usize>>, anyhow::Error> {
+        info!(
+            "initializing transfer graph build from {}",
+            valhalla_tile_dir.display()
+        );
         let mut geometry = RwLock::new(Vec::new());
         let mut node_map = RwLock::new(HashMap::<GraphId, usize>::new());
         let mut next_node = RwLock::new(0usize);
@@ -104,13 +108,20 @@ impl<G: FastGraph, I: SphereIndex<usize>> TransferGraph<G, I> {
                 }
             }
         })?;
+        info!(
+            "finished edge enumeration: nodes={}, geometry_points={}",
+            *next_node.get_mut().unwrap(),
+            geometry.get_mut().unwrap().len()
+        );
         txn.commit()?;
+        info!("building spatial node index");
         let node_index = SphereIndexVec::build(geometry.into_inner().expect("Lock failed"));
         let mut graph = graph.into_inner().expect("Lock failed");
         info!("Freezing graph");
         graph.freeze();
         info!("Contracting");
         let graph = FastGraphBuilder::build(&graph);
+        info!("transfer graph contraction complete");
 
         Ok(TransferGraph {
             node_index,
@@ -120,9 +131,11 @@ impl<G: FastGraph, I: SphereIndex<usize>> TransferGraph<G, I> {
     }
 
     pub fn save_to_dir(&self, dir: PathBuf) -> Result<(), anyhow::Error> {
+        info!("writing transfer graph files to {}", dir.display());
         self.graph.save_static(dir.join("transfer_graph.bin"))?;
         self.node_index
             .write_to_file(dir.join("transfer_node_index.bin"))?;
+        info!("finished writing transfer graph files");
         Ok(())
     }
 
