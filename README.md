@@ -32,9 +32,81 @@ Solari is a high-performance transit routing engine built using the [RAPTOR algo
 1. **Rust** (`rustc >= 1.86` tested).
 2. **OpenSSL development package**: Install via your OS's package manager (e.g., `libssl-dev` on Ubuntu).
 
-### TODO: Quickstart
+### Quickstart
 
-It used to be pretty simple to get a Solari instance up and running but we added support for [pedestrian routing](https://github.com/ellenhp/solari/pull/16) during transfers which complicated setup. Awaiting new documentation.
+Solari now needs two kinds of input data:
+
+- GTFS feeds for the transit timetable
+- a prebuilt pedestrian transfer graph derived from Valhalla tiles
+
+That means the setup flow is:
+
+1. get or build a directory of Valhalla tiles
+2. export Solari's transfer graph from those tiles
+3. build a timetable from one or more GTFS feeds
+4. run the server with the timetable directory and transfer graph directory
+
+If you already have Valhalla tiles, the shortest path looks like this.
+
+Build the transfer graph:
+
+```bash
+cargo run -p solari-export-graph -- \
+  --valhalla_tiles data/valhalla_tiles \
+  --output data/transfer_graph
+```
+
+This writes:
+
+- `graph_metadata.db`
+- `transfer_graph.bin`
+- `transfer_node_index.bin`
+
+Build the timetable from GTFS:
+
+```bash
+cargo run -p solari-cli -- build \
+  --base_path data/timetable \
+  --gtfs_path data/gtfs \
+  --valhalla_tiles data/transfer_graph
+```
+
+Notes:
+
+- `--gtfs_path` can point to a single GTFS zip or a directory of GTFS zips
+- `--valhalla_tiles` here is currently the path passed into the timetable build step for transfer generation support
+- `--num_threads` is optional if you want to speed up the build
+
+Run the server:
+
+```bash
+cargo run -p solari-server -- \
+  --base_path data/timetable \
+  --valhalla_tile_path data/transfer_graph \
+  --port 8000
+```
+
+Then test it:
+
+```bash
+curl -X POST http://localhost:8000/v1/plan \
+  -H 'content-type: application/json' \
+  --data @sample_request.json
+```
+
+Important detail: despite the flag name `--valhalla_tile_path`, the server is actually looking for the exported transfer graph files in that directory, not raw Valhalla tiles. If you omit the flag, the server assumes those files live in `base_path`.
+
+### Getting Valhalla tiles
+
+Solari assumes you already have Valhalla tiles available.
+
+If you do not, you need to build or obtain them separately first. A practical setup is:
+
+- raw Valhalla tiles in `data/valhalla_tiles/`
+- exported Solari transfer graph in `data/transfer_graph/`
+- Solari timetable in `data/timetable/`
+
+We should eventually add a fuller end-to-end guide for acquiring or building Valhalla tiles, but the commands above are enough to get Solari running if you already have them.
 
 ## Architecture
 - **RAPTOR Algorithm**: Implements all pruning rules from the original paper for optimal performance.
