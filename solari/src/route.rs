@@ -1289,6 +1289,33 @@ where
                         continue;
                     }
                     let route = self.timetable.route(route_id);
+                    let is_amtrak_route = {
+                        let first_stop_name = route.route_stops(self.timetable).first()
+                            .map(|rs| rs.stop(self.timetable).metadata(self.timetable).name.clone().unwrap_or_default())
+                            .unwrap_or_default();
+                        let last_stop_name = route.route_stops(self.timetable).last()
+                            .map(|rs| rs.stop(self.timetable).metadata(self.timetable).name.clone().unwrap_or_default())
+                            .unwrap_or_default();
+                        first_stop_name == "Los Angeles" || last_stop_name == "Los Angeles"
+                            || first_stop_name == "San Diego" || last_stop_name == "San Diego"
+                            || first_stop_name == "San Luis Obispo" || last_stop_name == "San Luis Obispo"
+                    };
+                    if is_amtrak_route {
+                        let dep_stop_name = departure.route_stop(self.timetable).stop(self.timetable)
+                            .metadata(self.timetable).name.clone().unwrap_or_default();
+                        info!(
+                            round = round,
+                            route_id = route_id,
+                            num_stops = route.route_stops(self.timetable).len(),
+                            num_trips = route.route_trips(self.timetable).len(),
+                            marked_stop = %dep_stop_name,
+                            marked_trip_index = departure.trip_index,
+                            marked_departure = departure.departure().epoch_seconds(),
+                            marked_arrival = departure.arrival().epoch_seconds(),
+                            marked_route_stop_seq = departure.route_stop_seq,
+                            "AMTRAK_DEBUG: scanning route"
+                        );
+                    }
                     let mut current_trip: Option<(Trip, RouteStop)> = None;
                     let mut found_first_stop = false;
                     let mut departure_stop_seq = 0usize;
@@ -1318,6 +1345,21 @@ where
                                 );
                                 continue;
                             };
+                            let arrival_at_stop = current_trip.stop_times(self.timetable)[route_stop.stop_seq()]
+                                .arrival();
+                            if is_amtrak_route {
+                                let stop_name = route_stop.stop(self.timetable).metadata(self.timetable).name.clone().unwrap_or_default();
+                                info!(
+                                    round = round,
+                                    stop_name = %stop_name,
+                                    stop_seq = route_stop.stop_seq(),
+                                    trip_arrival = arrival_at_stop.epoch_seconds(),
+                                    trip_departure = departure_trip_stop_time.departure().epoch_seconds(),
+                                    board_stop = %current_trip_start.stop(self.timetable).metadata(self.timetable).name.clone().unwrap_or_default(),
+                                    board_stop_seq = departure_stop_seq,
+                                    "AMTRAK_DEBUG: visiting stop on route"
+                                );
+                            }
                             if self.maybe_update_arrival_time_and_route(
                                 round,
                                 &InternalStepLocation::Stop(
@@ -1325,13 +1367,21 @@ where
                                 ),
                                 departure_trip_stop_time.departure(),
                                 &InternalStepLocation::Stop(route_stop.stop(self.timetable)),
-                                current_trip.stop_times(self.timetable)[route_stop.stop_seq()]
-                                    .arrival(),
+                                arrival_at_stop,
                                 Some(current_trip.route(self.timetable)),
                                 Some(current_trip.clone()),
                                 previous_step,
                             ) {
                                 marked_stops_count += 1;
+                                if is_amtrak_route {
+                                    let stop_name = route_stop.stop(self.timetable).metadata(self.timetable).name.clone().unwrap_or_default();
+                                    info!(
+                                        round = round,
+                                        stop_name = %stop_name,
+                                        arrival = arrival_at_stop.epoch_seconds(),
+                                        "AMTRAK_DEBUG: updated stop"
+                                    );
+                                }
 
                                 if let Some(trip) = self.earliest_trip_from(
                                     departure.route_stop(self.timetable),
@@ -1349,6 +1399,12 @@ where
                                         .unwrap()
                                         .final_time
                                     {
+                                        if is_amtrak_route {
+                                            info!(
+                                                round = round,
+                                                "AMTRAK_DEBUG: switching to earlier trip"
+                                            );
+                                        }
                                         *current_trip = trip;
                                     }
                                 }
@@ -1356,9 +1412,38 @@ where
                         }
 
                         if current_trip.is_none() {
+                            let best_time_at_stop = self.best_times_per_round[round as usize - 1]
+                                [route_stop.stop(self.timetable).id()]
+                                .as_ref()
+                                .map(|it| it.final_time.epoch_seconds())
+                                .unwrap_or(0);
                             current_trip = self
                                 .earliest_trip_from(route_stop, &departure.arrival())
                                 .map(|trip| (trip, route_stop.clone()));
+                            if is_amtrak_route {
+                                let stop_name = route_stop.stop(self.timetable).metadata(self.timetable).name.clone().unwrap_or_default();
+                                if let Some((trip, _)) = &current_trip {
+                                    let dep_time = trip.stop_times(self.timetable)[route_stop.stop_seq()].departure();
+                                    info!(
+                                        round = round,
+                                        stop_name = %stop_name,
+                                        stop_id = route_stop.stop(self.timetable).id(),
+                                        departure_arrival_key = departure.arrival().epoch_seconds(),
+                                        trip_dep = dep_time.epoch_seconds(),
+                                        best_time_prev_round = best_time_at_stop,
+                                        "AMTRAK_DEBUG: boarding route"
+                                    );
+                                } else {
+                                    info!(
+                                        round = round,
+                                        stop_name = %stop_name,
+                                        stop_id = route_stop.stop(self.timetable).id(),
+                                        departure_arrival_key = departure.arrival().epoch_seconds(),
+                                        best_time_prev_round = best_time_at_stop,
+                                        "AMTRAK_DEBUG: no trip found at stop"
+                                    );
+                                }
+                            }
                         }
                     }
                 }
