@@ -33,6 +33,7 @@ pub use crate::input_graph::InputGraph;
 pub use crate::path_calculator::{PathCalculator, WeightCalculator};
 pub use crate::shortest_path::ShortestPath;
 pub use crate::weight_calculator::SparseWeightCalculator;
+pub use crate::sparse_path_calculator::SparsePathCalculator;
 
 mod constants;
 #[cfg(test)]
@@ -49,6 +50,7 @@ mod preparation_graph;
 mod shortest_path;
 mod valid_flags;
 pub mod weight_calculator;
+mod sparse_path_calculator;
 mod witness_search;
 
 /// Prepares the given `InputGraph` for fast shortest path calculations.

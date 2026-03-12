@@ -16,7 +16,7 @@ use crate::valinor::edge_export::enumerate_edges;
 use anyhow::{Ok, bail};
 use fast_paths::{
     FastGraph, FastGraphBuilder, FastGraphStatic, FastGraphVec, InputGraph, PathCalculator,
-    SparseWeightCalculator, create_calculator,
+    SparseWeightCalculator, SparsePathCalculator, create_calculator,
 };
 use geo::{Coord, Geodesic, Length, LineString};
 use log::{error, info};
@@ -187,11 +187,9 @@ impl<G: FastGraph, I: SphereIndex<usize>> TransferGraph<G, I> {
             to_unique = to_unique.len(),
             "transfer_path inputs"
         );
-        // 2_000_000 mm = 2000m, generous limit for walking transfers
-        let max_weight_mm = 2_000_000;
         if let Some(path) = search_context
             .ensure_path_calculator()
-            .calc_path_multiple_sources_and_targets_with_max(&self.graph, from, to, max_weight_mm)
+            .calc_path_multiple_sources_and_targets(&self.graph, from, to)
         {
             let t2 = std::time::Instant::now();
             let database = self
@@ -322,7 +320,7 @@ pub struct TransferPath {
 
 pub struct TransferGraphSearcher<G: FastGraph, I: SphereIndex<usize>> {
     weight_calculator: SparseWeightCalculator,
-    path_calculator: Option<PathCalculator>,
+    path_calculator: Option<SparsePathCalculator>,
     graph: Arc<TransferGraph<G, I>>,
 }
 
@@ -335,9 +333,9 @@ impl<G: FastGraph, I: SphereIndex<usize>> TransferGraphSearcher<G, I> {
         }
     }
 
-    fn ensure_path_calculator(&mut self) -> &mut PathCalculator {
+    fn ensure_path_calculator(&mut self) -> &mut SparsePathCalculator {
         if self.path_calculator.is_none() {
-            self.path_calculator = Some(create_calculator(&self.graph.graph));
+            self.path_calculator = Some(SparsePathCalculator::new(self.graph.graph.get_num_nodes()));
         }
         self.path_calculator.as_mut().unwrap()
     }
