@@ -13,6 +13,12 @@ use memmap2::Mmap;
 use s2::{cell::Cell, cellid::CellID, latlng::LatLng, rect::Rect, region::RegionCoverer, s1::Deg};
 use solari_geomath::EARTH_RADIUS_APPROX;
 
+pub fn cell_id_for_coord(coord: &Coord) -> u64 {
+    let lat_lng = LatLng::from_degrees(coord.y, coord.x);
+    let cell_id: CellID = lat_lng.into();
+    cell_id.0
+}
+
 pub struct NearestNeighborResult<'a, D: Sized + Pod + Zeroable> {
     pub approx_distance_meters: f64,
     pub data: &'a D,
@@ -169,10 +175,8 @@ pub struct IndexedPoint<D: Sized> {
 
 impl<D: Sized + Pod + Zeroable> IndexedPoint<D> {
     pub fn new(coord: &Coord, data: D) -> IndexedPoint<D> {
-        let lat_lng = LatLng::from_degrees(coord.y, coord.x);
-        let cell_id: CellID = lat_lng.into();
         IndexedPoint {
-            cell: cell_id.0,
+            cell: cell_id_for_coord(coord),
             data,
         }
     }

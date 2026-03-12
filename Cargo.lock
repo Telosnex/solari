@@ -815,7 +815,6 @@ dependencies = [
 [[package]]
 name = "fast_paths"
 version = "1.0.0"
-source = "git+https://github.com/ellenhp/fast_paths?rev=c3c05f245fcb9cffaf689f161fcc7c8c03a6a1dc#c3c05f245fcb9cffaf689f161fcc7c8c03a6a1dc"
 dependencies = [
  "anyhow",
  "bytemuck",
@@ -3057,6 +3056,7 @@ dependencies = [
  "clap",
  "redb",
  "rkyv",
+ "serde_json",
  "solari-spatial",
  "solari-transfers",
  "tracing",
@@ -3131,10 +3131,13 @@ dependencies = [
  "log",
  "memmap2",
  "polyline",
+ "rayon",
  "redb",
  "serde",
+ "serde_json",
  "solari-geomath",
  "solari-spatial",
+ "tracing",
  "valhalla-graphtile",
 ]
 

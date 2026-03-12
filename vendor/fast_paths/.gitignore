@@ -1,0 +1,12 @@
+/target
+**/*.rs.bk
+Cargo.lock
+.DS_Store
+
+# jetbrains
+.idea
+*.iml
+
+example.fp
+local/
+local

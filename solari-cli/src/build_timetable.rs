@@ -1,5 +1,5 @@
 use clap::Parser;
-use solari::timetable::build::{concat_timetables, timetable_from_feeds};
+use solari::timetable::build::{concat_timetables, prepare_timetables_from_feeds, timetable_from_feeds};
 use std::{fs, path::PathBuf};
 
 #[derive(Parser)]
@@ -14,17 +14,21 @@ pub struct BuildArgs {
     pub num_threads: usize,
     #[arg(long, default_value_t = false)]
     pub concat_only: bool,
+    #[arg(long, default_value_t = false)]
+    pub prepare_only: bool,
 }
 
 pub async fn run_build_timetable(args: BuildArgs) -> Result<(), anyhow::Error> {
-    rayon::ThreadPoolBuilder::new()
+    let _ = rayon::ThreadPoolBuilder::new()
         .num_threads(args.num_threads)
-        .build_global()
-        .unwrap();
+        .build_global();
+
     if args.concat_only {
         let paths: Vec<PathBuf> = fs::read_dir(&args.base_path)
             .unwrap()
             .map(|p| p.unwrap().path())
+            .filter(|path| path.is_dir())
+            .filter(|path| path.join("feed.complete").exists())
             .collect();
 
         let _timetable = concat_timetables(&paths, &args.base_path.into(), &args.valhalla_tiles)
@@ -36,25 +40,38 @@ pub async fn run_build_timetable(args: BuildArgs) -> Result<(), anyhow::Error> {
             .map(|p| p.unwrap().path())
             .collect();
 
-        let _timetable = timetable_from_feeds(
-            &paths,
-            &args.base_path.into(),
-            &args.valhalla_tiles,
-            None,
-            None,
-        )
-        .await
-        .unwrap();
+        if args.prepare_only {
+            prepare_timetables_from_feeds(&paths, &args.base_path.into(), None, None)
+                .await
+                .unwrap();
+        } else {
+            let _timetable = timetable_from_feeds(
+                &paths,
+                &args.base_path.into(),
+                &args.valhalla_tiles,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        }
     } else {
-        let _timetable = timetable_from_feeds(
-            &[args.gtfs_path.into()],
-            &args.base_path.into(),
-            &args.valhalla_tiles,
-            None,
-            None,
-        )
-        .await
-        .unwrap();
+        let single = vec![args.gtfs_path.clone()];
+        if args.prepare_only {
+            prepare_timetables_from_feeds(&single, &args.base_path.into(), None, None)
+                .await
+                .unwrap();
+        } else {
+            let _timetable = timetable_from_feeds(
+                &single,
+                &args.base_path.into(),
+                &args.valhalla_tiles,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        }
     }
     Ok(())
 }

@@ -2,6 +2,9 @@
 resolver = "2"
 members = ["solari", "solari-cli", "solari-dmfr", "solari-export-graph", "solari-geomath", "solari-server", "solari-spatial", "solari-test", "solari-transfers"]
 
+[patch."https://github.com/ellenhp/fast_paths"]
+fast_paths = { path = "vendor/fast_paths" }
+
 [profile.release-debug]
 inherits = "release"
 debug = true

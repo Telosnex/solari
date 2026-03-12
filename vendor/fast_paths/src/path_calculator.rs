@@ -1,0 +1,674 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
+use std::collections::BinaryHeap;
+
+use crate::constants::Weight;
+use crate::constants::INVALID_EDGE;
+use crate::constants::INVALID_NODE;
+use crate::constants::WEIGHT_MAX;
+use crate::constants::{EdgeId, NodeId};
+use crate::fast_graph::FastGraph;
+use crate::heap_item::HeapItem;
+use crate::shortest_path::ShortestPath;
+use crate::valid_flags::ValidFlags;
+
+
+pub struct WeightCalculator {
+    num_nodes: usize,
+    data_fwd: Vec<WeightData>,
+    data_bwd: Vec<WeightData>,
+    valid_flags_fwd: ValidFlags,
+    valid_flags_bwd: ValidFlags,
+    heap_fwd: BinaryHeap<HeapItem>,
+    heap_bwd: BinaryHeap<HeapItem>,
+}
+
+impl WeightCalculator {
+    pub fn new(num_nodes: usize) -> Self {
+        WeightCalculator {
+            num_nodes,
+            data_fwd: (0..num_nodes).map(|_i| WeightData::new()).collect(),
+            data_bwd: (0..num_nodes).map(|_i| WeightData::new()).collect(),
+            valid_flags_fwd: ValidFlags::new(num_nodes),
+            valid_flags_bwd: ValidFlags::new(num_nodes),
+            heap_fwd: BinaryHeap::new(),
+            heap_bwd: BinaryHeap::new(),
+        }
+    }
+
+    pub fn calc_weight_multiple_sources_and_targets<G: FastGraph>(
+        &mut self,
+        graph: &G,
+        starts: Vec<(NodeId, Weight)>,
+        ends: Vec<(NodeId, Weight)>,
+    ) -> Option<Weight> {
+        assert_eq!(graph.get_num_nodes(), self.num_nodes, "given graph has invalid node count");
+        assert!(!starts.is_empty(), "there has to be at least one start");
+        assert!(!ends.is_empty(), "there has to be at least one end");
+        for (start_node, _) in &starts {
+            assert!(*start_node < self.num_nodes, "invalid start node");
+        }
+        for (end_node, _) in &ends {
+            assert!(*end_node < self.num_nodes, "invalid end node");
+        }
+        self.heap_fwd.clear();
+        self.heap_bwd.clear();
+        self.valid_flags_fwd.invalidate_all();
+        self.valid_flags_bwd.invalidate_all();
+
+        let mut best_weight = WEIGHT_MAX;
+
+        for (start_node, start_weight) in &starts {
+            for (end_node, end_weight) in &ends {
+                if *start_node == *end_node
+                    && *start_weight < WEIGHT_MAX
+                    && *end_weight < WEIGHT_MAX
+                    && *start_weight + *end_weight < best_weight
+                {
+                    best_weight = *start_weight + *end_weight;
+                }
+            }
+        }
+
+        for (node, weight) in starts {
+            if weight < self.get_weight_fwd(node) {
+                self.update_node_fwd(node, weight);
+                self.heap_fwd.push(HeapItem::new(weight, node));
+            }
+        }
+        for (node, weight) in ends {
+            if weight < self.get_weight_bwd(node) {
+                self.update_node_bwd(node, weight);
+                self.heap_bwd.push(HeapItem::new(weight, node));
+            }
+        }
+
+        loop {
+            if self.heap_fwd.is_empty() && self.heap_bwd.is_empty() {
+                break;
+            }
+            loop {
+                if self.heap_fwd.is_empty() {
+                    break;
+                }
+                let curr = self.heap_fwd.pop().unwrap();
+                if self.is_settled_fwd(curr.node_id) {
+                    continue;
+                }
+                if curr.weight > best_weight {
+                    break;
+                }
+                if self.is_stallable_fwd(graph, curr) {
+                    continue;
+                }
+                let begin = graph.begin_out_edges(curr.node_id);
+                let end = graph.end_out_edges(curr.node_id);
+                for edge_id in begin..end {
+                    let adj = graph.edges_fwd()[edge_id].adj_node;
+                    let edge_weight = graph.edges_fwd()[edge_id].weight;
+                    let weight = curr.weight + edge_weight;
+                    if weight < self.get_weight_fwd(adj) {
+                        self.update_node_fwd(adj, weight);
+                        self.heap_fwd.push(HeapItem::new(weight, adj));
+                    }
+                }
+                self.data_fwd[curr.node_id].settled = true;
+                if self.valid_flags_bwd.is_valid(curr.node_id)
+                    && curr.weight + self.get_weight_bwd(curr.node_id) < best_weight
+                {
+                    best_weight = curr.weight + self.get_weight_bwd(curr.node_id);
+                }
+                break;
+            }
+
+            loop {
+                if self.heap_bwd.is_empty() {
+                    break;
+                }
+                let curr = self.heap_bwd.pop().unwrap();
+                if self.is_settled_bwd(curr.node_id) {
+                    continue;
+                }
+                if curr.weight > best_weight {
+                    break;
+                }
+                if self.is_stallable_bwd(graph, curr) {
+                    continue;
+                }
+                let begin = graph.begin_in_edges(curr.node_id);
+                let end = graph.end_in_edges(curr.node_id);
+                for edge_id in begin..end {
+                    let adj = graph.edges_bwd()[edge_id].adj_node;
+                    let edge_weight = graph.edges_bwd()[edge_id].weight;
+                    let weight = curr.weight + edge_weight;
+                    if weight < self.get_weight_bwd(adj) {
+                        self.update_node_bwd(adj, weight);
+                        self.heap_bwd.push(HeapItem::new(weight, adj));
+                    }
+                }
+                self.data_bwd[curr.node_id].settled = true;
+                if self.valid_flags_fwd.is_valid(curr.node_id)
+                    && curr.weight + self.get_weight_fwd(curr.node_id) < best_weight
+                {
+                    best_weight = curr.weight + self.get_weight_fwd(curr.node_id);
+                }
+                break;
+            }
+        }
+
+        if best_weight == WEIGHT_MAX { None } else { Some(best_weight) }
+    }
+
+    fn is_stallable_fwd<G: FastGraph>(&self, graph: &G, curr: HeapItem) -> bool {
+        let begin = graph.begin_in_edges(curr.node_id);
+        let end = graph.end_in_edges(curr.node_id);
+        for edge_id in begin..end {
+            let adj = graph.edges_bwd()[edge_id].adj_node;
+            let adj_weight = self.get_weight_fwd(adj);
+            if adj_weight == WEIGHT_MAX { continue; }
+            let edge_weight = graph.edges_bwd()[edge_id].weight;
+            if adj_weight + edge_weight < curr.weight { return true; }
+        }
+        false
+    }
+
+    fn is_stallable_bwd<G: FastGraph>(&self, graph: &G, curr: HeapItem) -> bool {
+        let begin = graph.begin_out_edges(curr.node_id);
+        let end = graph.end_out_edges(curr.node_id);
+        for edge_id in begin..end {
+            let adj = graph.edges_fwd()[edge_id].adj_node;
+            let adj_weight = self.get_weight_bwd(adj);
+            if adj_weight == WEIGHT_MAX { continue; }
+            let edge_weight = graph.edges_fwd()[edge_id].weight;
+            if adj_weight + edge_weight < curr.weight { return true; }
+        }
+        false
+    }
+
+    fn update_node_fwd(&mut self, node: NodeId, weight: Weight) {
+        self.valid_flags_fwd.set_valid(node);
+        self.data_fwd[node].settled = false;
+        self.data_fwd[node].weight = weight;
+    }
+
+    fn update_node_bwd(&mut self, node: NodeId, weight: Weight) {
+        self.valid_flags_bwd.set_valid(node);
+        self.data_bwd[node].settled = false;
+        self.data_bwd[node].weight = weight;
+    }
+
+    fn is_settled_fwd(&self, node: NodeId) -> bool {
+        self.valid_flags_fwd.is_valid(node) && self.data_fwd[node].settled
+    }
+
+    fn is_settled_bwd(&self, node: NodeId) -> bool {
+        self.valid_flags_bwd.is_valid(node) && self.data_bwd[node].settled
+    }
+
+    fn get_weight_fwd(&self, node: NodeId) -> Weight {
+        if self.valid_flags_fwd.is_valid(node) { self.data_fwd[node].weight } else { WEIGHT_MAX }
+    }
+
+    fn get_weight_bwd(&self, node: NodeId) -> Weight {
+        if self.valid_flags_bwd.is_valid(node) { self.data_bwd[node].weight } else { WEIGHT_MAX }
+    }
+}
+
+struct WeightData {
+    settled: bool,
+    weight: Weight,
+}
+
+impl WeightData {
+    fn new() -> Self {
+        WeightData { settled: false, weight: WEIGHT_MAX }
+    }
+}
+
+pub struct PathCalculator {
+    num_nodes: usize,
+    data_fwd: Vec<Data>,
+    data_bwd: Vec<Data>,
+    valid_flags_fwd: ValidFlags,
+    valid_flags_bwd: ValidFlags,
+    heap_fwd: BinaryHeap<HeapItem>,
+    heap_bwd: BinaryHeap<HeapItem>,
+}
+
+impl PathCalculator {
+    pub fn new(num_nodes: usize) -> Self {
+        PathCalculator {
+            num_nodes,
+            data_fwd: (0..num_nodes).map(|_i| Data::new()).collect(),
+            data_bwd: (0..num_nodes).map(|_i| Data::new()).collect(),
+            valid_flags_fwd: ValidFlags::new(num_nodes),
+            valid_flags_bwd: ValidFlags::new(num_nodes),
+            heap_fwd: BinaryHeap::new(),
+            heap_bwd: BinaryHeap::new(),
+        }
+    }
+
+    pub fn calc_path<G: FastGraph>(
+        &mut self,
+        graph: &G,
+        start: NodeId,
+        end: NodeId,
+    ) -> Option<ShortestPath> {
+        self.calc_path_multiple_sources_and_targets(graph, vec![(start, 0)], vec![(end, 0)])
+    }
+
+    pub fn calc_path_multiple_sources_and_targets<G: FastGraph>(
+        &mut self,
+        graph: &G,
+        starts: Vec<(NodeId, Weight)>,
+        ends: Vec<(NodeId, Weight)>,
+    ) -> Option<ShortestPath> {
+        self.calc_weight_and_optional_path(graph, starts, ends, true)
+            .map(|(best_weight, nodes)| {
+                let nodes = nodes.expect("path nodes should be present when include_path=true");
+                ShortestPath::new(nodes[0], nodes[nodes.len() - 1], best_weight, nodes)
+            })
+    }
+
+    pub fn calc_weight_multiple_sources_and_targets<G: FastGraph>(
+        &mut self,
+        graph: &G,
+        starts: Vec<(NodeId, Weight)>,
+        ends: Vec<(NodeId, Weight)>,
+    ) -> Option<Weight> {
+        self.calc_weight_and_optional_path(graph, starts, ends, false)
+            .map(|(best_weight, _)| best_weight)
+    }
+
+    fn calc_weight_and_optional_path<G: FastGraph>(
+        &mut self,
+        graph: &G,
+        starts: Vec<(NodeId, Weight)>,
+        ends: Vec<(NodeId, Weight)>,
+        include_path: bool,
+    ) -> Option<(Weight, Option<Vec<NodeId>>)> {
+        assert_eq!(
+            graph.get_num_nodes(),
+            self.num_nodes,
+            "given graph has invalid node count"
+        );
+        assert!(!starts.is_empty(), "there has to be at least one start");
+        assert!(!ends.is_empty(), "there has to be at least one end");
+        for (start_node, _) in &starts {
+            assert!(*start_node < self.num_nodes, "invalid start node");
+        }
+        for (end_node, _) in &ends {
+            assert!(*end_node < self.num_nodes, "invalid end node");
+        }
+        self.heap_fwd.clear();
+        self.heap_bwd.clear();
+        self.valid_flags_fwd.invalidate_all();
+        self.valid_flags_bwd.invalidate_all();
+
+        let mut best_weight = WEIGHT_MAX;
+        let mut meeting_node = INVALID_NODE;
+
+        for (start_node, start_weight) in &starts {
+            for (end_node, end_weight) in &ends {
+                if *start_node == *end_node
+                    && *start_weight < WEIGHT_MAX
+                    && *end_weight < WEIGHT_MAX
+                    && *start_weight + *end_weight < best_weight
+                {
+                    best_weight = *start_weight + *end_weight;
+                    meeting_node = *end_node;
+                }
+            }
+        }
+
+        for (node, weight) in starts {
+            if weight < self.get_weight_fwd(node) {
+                // this is a bit of a hack, we store the start node as parent even though it is not
+                // the parent. this way we can easily obtain the target node when we unpack the path
+                // later
+                self.update_node_fwd(node, weight, node, INVALID_EDGE);
+                self.heap_fwd.push(HeapItem::new(weight, node));
+            }
+        }
+        for (node, weight) in ends {
+            if weight < self.get_weight_bwd(node) {
+                // ... same here
+                self.update_node_bwd(node, weight, node, INVALID_EDGE);
+                self.heap_bwd.push(HeapItem::new(weight, node));
+            }
+        }
+
+        loop {
+            if self.heap_fwd.is_empty() && self.heap_bwd.is_empty() {
+                break;
+            }
+            loop {
+                if self.heap_fwd.is_empty() {
+                    break;
+                }
+                let curr = self.heap_fwd.pop().unwrap();
+                if self.is_settled_fwd(curr.node_id) {
+                    continue;
+                }
+                if curr.weight > best_weight {
+                    break;
+                }
+                // stall on demand optimization
+                if self.is_stallable_fwd(graph, curr) {
+                    continue;
+                }
+                let begin = graph.begin_out_edges(curr.node_id);
+                let end = graph.end_out_edges(curr.node_id);
+                for edge_id in begin..end {
+                    let adj = graph.edges_fwd()[edge_id].adj_node;
+                    let edge_weight = graph.edges_fwd()[edge_id].weight;
+                    let weight = curr.weight + edge_weight;
+                    if weight < self.get_weight_fwd(adj) {
+                        self.update_node_fwd(adj, weight, curr.node_id, edge_id);
+                        self.heap_fwd.push(HeapItem::new(weight, adj));
+                    }
+                }
+                self.data_fwd[curr.node_id].settled = true;
+                if self.valid_flags_bwd.is_valid(curr.node_id)
+                    && curr.weight + self.get_weight_bwd(curr.node_id) < best_weight
+                {
+                    best_weight = curr.weight + self.get_weight_bwd(curr.node_id);
+                    meeting_node = curr.node_id;
+                }
+                break;
+            }
+
+            loop {
+                if self.heap_bwd.is_empty() {
+                    break;
+                }
+                let curr = self.heap_bwd.pop().unwrap();
+                if self.is_settled_bwd(curr.node_id) {
+                    continue;
+                }
+                if curr.weight > best_weight {
+                    break;
+                }
+                // stall on demand optimization
+                if self.is_stallable_bwd(graph, curr) {
+                    continue;
+                }
+                let begin = graph.begin_in_edges(curr.node_id);
+                let end = graph.end_in_edges(curr.node_id);
+                for edge_id in begin..end {
+                    let adj = graph.edges_bwd()[edge_id].adj_node;
+                    let edge_weight = graph.edges_bwd()[edge_id].weight;
+                    let weight = curr.weight + edge_weight;
+                    if weight < self.get_weight_bwd(adj) {
+                        self.update_node_bwd(adj, weight, curr.node_id, edge_id);
+                        self.heap_bwd.push(HeapItem::new(weight, adj));
+                    }
+                }
+                self.data_bwd[curr.node_id].settled = true;
+                if self.valid_flags_fwd.is_valid(curr.node_id)
+                    && curr.weight + self.get_weight_fwd(curr.node_id) < best_weight
+                {
+                    best_weight = curr.weight + self.get_weight_fwd(curr.node_id);
+                    meeting_node = curr.node_id;
+                }
+                break;
+            }
+        }
+
+        if meeting_node == INVALID_NODE {
+            None
+        } else {
+            assert!(best_weight < WEIGHT_MAX);
+            let nodes = if include_path {
+                let nodes = self.extract_nodes(graph, meeting_node);
+                assert!(!nodes.is_empty());
+                Some(nodes)
+            } else {
+                None
+            };
+            Some((best_weight, nodes))
+        }
+    }
+
+    fn is_stallable_fwd<G: FastGraph>(&self, graph: &G, curr: HeapItem) -> bool {
+        let begin = graph.begin_in_edges(curr.node_id);
+        let end = graph.end_in_edges(curr.node_id);
+        for edge_id in begin..end {
+            let adj = graph.edges_bwd()[edge_id].adj_node;
+            let adj_weight = self.get_weight_fwd(adj);
+            if adj_weight == WEIGHT_MAX {
+                continue;
+            }
+            let edge_weight = graph.edges_bwd()[edge_id].weight;
+            if adj_weight + edge_weight < curr.weight {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn is_stallable_bwd<G: FastGraph>(&self, graph: &G, curr: HeapItem) -> bool {
+        let begin = graph.begin_out_edges(curr.node_id);
+        let end = graph.end_out_edges(curr.node_id);
+        for edge_id in begin..end {
+            let adj = graph.edges_fwd()[edge_id].adj_node;
+            let adj_weight = self.get_weight_bwd(adj);
+            if adj_weight == WEIGHT_MAX {
+                continue;
+            }
+            let edge_weight = graph.edges_fwd()[edge_id].weight;
+            if adj_weight + edge_weight < curr.weight {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn extract_nodes<G: FastGraph>(&self, graph: &G, meeting_node: NodeId) -> Vec<NodeId> {
+        assert_ne!(meeting_node, INVALID_NODE);
+        assert!(self.valid_flags_fwd.is_valid(meeting_node));
+        assert!(self.valid_flags_bwd.is_valid(meeting_node));
+        let mut result = Vec::new();
+        let mut node = meeting_node;
+        while self.data_fwd[node].inc_edge != INVALID_EDGE {
+            PathCalculator::unpack_fwd(graph, &mut result, self.data_fwd[node].inc_edge, true);
+            node = self.data_fwd[node].parent;
+        }
+        result.reverse();
+        node = meeting_node;
+        while self.data_bwd[node].inc_edge != INVALID_EDGE {
+            PathCalculator::unpack_bwd(graph, &mut result, self.data_bwd[node].inc_edge, false);
+            node = self.data_bwd[node].parent;
+        }
+        // we stored the target node as 'parent' of the root of the shortest tree, so we can use it
+        // here
+        result.push(node);
+        result
+    }
+
+    fn unpack_fwd<G: FastGraph>(
+        graph: &G,
+        nodes: &mut Vec<NodeId>,
+        edge_id: EdgeId,
+        reverse: bool,
+    ) {
+        if !graph.edges_fwd()[edge_id].is_shortcut() {
+            nodes.push(graph.edges_fwd()[edge_id].base_node);
+            return;
+        }
+        if reverse {
+            PathCalculator::unpack_fwd(
+                graph,
+                nodes,
+                graph.edges_fwd()[edge_id].replaced_out_edge,
+                reverse,
+            );
+            PathCalculator::unpack_bwd(
+                graph,
+                nodes,
+                graph.edges_fwd()[edge_id].replaced_in_edge,
+                reverse,
+            );
+        } else {
+            PathCalculator::unpack_bwd(
+                graph,
+                nodes,
+                graph.edges_fwd()[edge_id].replaced_in_edge,
+                reverse,
+            );
+            PathCalculator::unpack_fwd(
+                graph,
+                nodes,
+                graph.edges_fwd()[edge_id].replaced_out_edge,
+                reverse,
+            );
+        }
+    }
+
+    fn unpack_bwd<G: FastGraph>(
+        graph: &G,
+        nodes: &mut Vec<NodeId>,
+        edge_id: EdgeId,
+        reverse: bool,
+    ) {
+        if !graph.edges_bwd()[edge_id].is_shortcut() {
+            nodes.push(graph.edges_bwd()[edge_id].adj_node);
+            return;
+        }
+        if reverse {
+            PathCalculator::unpack_fwd(
+                graph,
+                nodes,
+                graph.edges_bwd()[edge_id].replaced_out_edge,
+                reverse,
+            );
+            PathCalculator::unpack_bwd(
+                graph,
+                nodes,
+                graph.edges_bwd()[edge_id].replaced_in_edge,
+                reverse,
+            );
+        } else {
+            PathCalculator::unpack_bwd(
+                graph,
+                nodes,
+                graph.edges_bwd()[edge_id].replaced_in_edge,
+                reverse,
+            );
+            PathCalculator::unpack_fwd(
+                graph,
+                nodes,
+                graph.edges_bwd()[edge_id].replaced_out_edge,
+                reverse,
+            );
+        }
+    }
+
+    fn update_node_fwd(&mut self, node: NodeId, weight: Weight, parent: NodeId, inc_edge: EdgeId) {
+        self.valid_flags_fwd.set_valid(node);
+        self.data_fwd[node].settled = false;
+        self.data_fwd[node].weight = weight;
+        self.data_fwd[node].parent = parent;
+        self.data_fwd[node].inc_edge = inc_edge;
+    }
+
+    fn update_node_bwd(&mut self, node: NodeId, weight: Weight, parent: NodeId, inc_edge: EdgeId) {
+        self.valid_flags_bwd.set_valid(node);
+        self.data_bwd[node].settled = false;
+        self.data_bwd[node].weight = weight;
+        self.data_bwd[node].parent = parent;
+        self.data_bwd[node].inc_edge = inc_edge;
+    }
+
+    fn is_settled_fwd(&self, node: NodeId) -> bool {
+        self.valid_flags_fwd.is_valid(node) && self.data_fwd[node].settled
+    }
+
+    fn is_settled_bwd(&self, node: NodeId) -> bool {
+        self.valid_flags_bwd.is_valid(node) && self.data_bwd[node].settled
+    }
+
+    fn get_weight_fwd(&self, node: NodeId) -> Weight {
+        if self.valid_flags_fwd.is_valid(node) {
+            self.data_fwd[node].weight
+        } else {
+            WEIGHT_MAX
+        }
+    }
+
+    fn get_weight_bwd(&self, node: NodeId) -> Weight {
+        if self.valid_flags_bwd.is_valid(node) {
+            self.data_bwd[node].weight
+        } else {
+            WEIGHT_MAX
+        }
+    }
+}
+
+struct Data {
+    settled: bool,
+    weight: Weight,
+    parent: NodeId,
+    inc_edge: usize,
+}
+
+impl Data {
+    fn new() -> Self {
+        Data {
+            settled: false,
+            weight: WEIGHT_MAX,
+            parent: INVALID_NODE,
+            inc_edge: INVALID_EDGE,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::fast_graph::{FastGraphEdge, FastGraphVec};
+
+    use super::*;
+
+    #[test]
+    fn unpack_fwd_single() {
+        // 0 -> 1
+        let mut g = FastGraphVec::new(2);
+        g.edges_fwd
+            .push(FastGraphEdge::new(0, 1, 3, INVALID_EDGE, INVALID_EDGE));
+        let mut nodes = vec![];
+        PathCalculator::unpack_fwd(&g, &mut nodes, 0, false);
+        assert_eq!(nodes, vec![0]);
+    }
+
+    #[test]
+    fn unpack_fwd_simple() {
+        // 0 -> 1 -> 2
+        let mut g = FastGraphVec::new(3);
+        g.edges_fwd
+            .push(FastGraphEdge::new(0, 1, 2, INVALID_EDGE, INVALID_EDGE));
+        g.edges_fwd.push(FastGraphEdge::new(0, 2, 5, 0, 0));
+        g.edges_bwd
+            .push(FastGraphEdge::new(2, 1, 3, INVALID_EDGE, INVALID_EDGE));
+        g.first_edge_ids_fwd = vec![0, 2, 0, 0];
+        let mut nodes = vec![];
+        PathCalculator::unpack_fwd(&g, &mut nodes, 1, false);
+        assert_eq!(nodes, vec![1, 0]);
+    }
+}

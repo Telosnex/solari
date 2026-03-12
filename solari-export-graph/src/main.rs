@@ -1,8 +1,8 @@
-use std::{path::PathBuf, sync::Arc};
+use std::path::PathBuf;
 
 use clap::Parser;
-use solari_spatial::SphereIndexVec;
-use solari_transfers::{TransferGraph, fast_paths::FastGraphVec};
+use solari_transfers::TransferGraphBuildArtifacts;
+use serde_json::to_string_pretty;
 use tracing::info;
 use tracing_subscriber::FmtSubscriber;
 
@@ -12,6 +12,10 @@ struct Args {
     valhalla_tiles: PathBuf,
     #[arg(long)]
     output: PathBuf,
+    #[arg(long, default_value_t = false)]
+    prepare_only: bool,
+    #[arg(long, default_value_t = false)]
+    reduction_stats_only: bool,
 }
 
 fn main() -> Result<(), anyhow::Error> {
@@ -24,15 +28,23 @@ fn main() -> Result<(), anyhow::Error> {
         output = %args.output.display(),
         "starting solari transfer graph export"
     );
-    info!("opening output database");
-    let database = Arc::new(redb::Database::create(
-        args.output.join("graph_metadata.db"),
-    )?);
-    info!("building transfer graph from valhalla tiles");
-    let transfer_graph =
-        TransferGraph::<FastGraphVec, SphereIndexVec<usize>>::new(&args.valhalla_tiles, database)?;
-    info!("saving transfer graph artifacts");
-    transfer_graph.save_to_dir(args.output)?;
+    info!("preparing resumable pre-contraction build artifacts");
+    let prepared = TransferGraphBuildArtifacts::prepare(&args.valhalla_tiles, &args.output)?;
+    info!(
+        compact_nodes = prepared.compact_node_count(),
+        "pre-contraction seam ready"
+    );
+    if args.reduction_stats_only {
+        let stats = prepared.analyze_reduction_potential()?;
+        println!("{}", to_string_pretty(&stats)?);
+        return Ok(());
+    }
+    if args.prepare_only {
+        info!("prepare-only requested; leaving contraction for a later resumable run");
+        return Ok(());
+    }
+    info!("starting contraction");
+    prepared.contract_and_write_graph()?;
     info!("transfer graph export complete");
     Ok(())
 }

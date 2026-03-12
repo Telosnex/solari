@@ -1,28 +1,35 @@
 use std::{
+    collections::VecDeque,
     fs::{self, File},
+    io::{Read, Write},
     marker::PhantomData,
     mem::size_of,
     path::PathBuf,
     pin::Pin,
     slice,
-    sync::Arc,
+    sync::{Arc, Mutex},
+    thread,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Error, Ok};
 use bytemuck::{cast_slice_mut, checked::cast_slice};
 use geo::Coord;
 use memmap2::{Mmap, MmapMut, MmapOptions};
-use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
+use rayon::{
+    iter::{IndexedParallelIterator, IntoParallelRefIterator, ParallelIterator},
+    ThreadPoolBuilder,
+};
 use redb::Database;
 use rstar::RTree;
 use s2::latlng::LatLng;
 use solari_geomath::lat_lng_to_cartesian;
-use solari_spatial::{SphereIndex, SphereIndexMmap};
+use solari_spatial::SphereIndexMmap;
 use solari_transfers::{
-    fast_paths::{FastGraph, FastGraphStatic},
+    fast_paths::FastGraphStatic,
     {TransferGraph, TransferGraphSearcher},
 };
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use crate::spatial::{IndexedStop, WALK_SPEED_MM_PER_SECOND};
 
@@ -55,7 +62,7 @@ pub struct MmapTimetable<'a> {
     transfers_slice: &'a [Transfer],
     rtree: RTree<IndexedStop>,
 
-    metadata_db: redb::Database,
+    metadata_db: Option<redb::Database>,
 
     phantom: &'a PhantomData<()>,
 }
@@ -137,6 +144,8 @@ impl<'a> Timetable<'a> for MmapTimetable<'a> {
     fn stop_metadata(&'a self, stop: &Stop) -> gtfs_structures::Stop {
         let table = self
             .metadata_db
+            .as_ref()
+            .expect("metadata db not open")
             .begin_read()
             .expect("Read failed")
             .open_table(STOP_METADATA_TABLE)
@@ -152,6 +161,8 @@ impl<'a> Timetable<'a> for MmapTimetable<'a> {
     fn trip_metadata(&'a self, trip: &Trip) -> TripMetadata {
         let table = self
             .metadata_db
+            .as_ref()
+            .expect("metadata db not open")
             .begin_read()
             .expect("Read failed")
             .open_table(TRIP_METADATA_TABLE)
@@ -167,6 +178,8 @@ impl<'a> Timetable<'a> for MmapTimetable<'a> {
     fn route_shape(&'a self, route: &Route) -> Option<Vec<ShapeCoordinate>> {
         let table = self
             .metadata_db
+            .as_ref()
+            .expect("metadata db not open")
             .begin_read()
             .expect("Read failed")
             .open_table(ROUTE_SHAPE_TABLE)
@@ -177,6 +190,193 @@ impl<'a> Timetable<'a> for MmapTimetable<'a> {
         } else {
             None
         }
+    }
+}
+
+struct PeriodicHeartbeat {
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    handle: Option<thread::JoinHandle<()>>,
+}
+
+impl PeriodicHeartbeat {
+    fn spawn(
+        label: &'static str,
+        completed: usize,
+        total: usize,
+        chunk_index: usize,
+        total_chunks: usize,
+    ) -> Self {
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop_clone = stop.clone();
+        let handle = thread::spawn(move || {
+            let start = Instant::now();
+            while !stop_clone.load(std::sync::atomic::Ordering::Relaxed) {
+                for _ in 0..100 {
+                    if stop_clone.load(std::sync::atomic::Ordering::Relaxed) {
+                        return;
+                    }
+                    thread::sleep(Duration::from_millis(100));
+                }
+                if stop_clone.load(std::sync::atomic::Ordering::Relaxed) {
+                    break;
+                }
+                let percent = if total == 0 {
+                    100.0
+                } else {
+                    (completed as f64 * 100.0) / total as f64
+                };
+                info!(
+                    phase = label,
+                    completed,
+                    total,
+                    percent,
+                    chunk_index,
+                    total_chunks,
+                    elapsed_seconds = start.elapsed().as_secs_f64(),
+                    "timetable concat heartbeat"
+                );
+            }
+        });
+        Self {
+            stop,
+            handle: Some(handle),
+        }
+    }
+}
+
+impl Drop for PeriodicHeartbeat {
+    fn drop(&mut self) {
+        self.stop
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+struct SearcherPool {
+    pool: Mutex<
+        VecDeque<
+            TransferGraphSearcher<
+                FastGraphStatic<'static>,
+                SphereIndexMmap<'static, usize>,
+            >,
+        >,
+    >,
+}
+
+impl SearcherPool {
+    fn new(
+        graph: Arc<TransferGraph<FastGraphStatic<'static>, SphereIndexMmap<'static, usize>>>,
+        size: usize,
+    ) -> Self {
+        let mut pool = VecDeque::with_capacity(size);
+        for _ in 0..size {
+            pool.push_back(TransferGraphSearcher::new(graph.clone()));
+        }
+        Self {
+            pool: Mutex::new(pool),
+        }
+    }
+
+    fn with_searcher<R>(
+        &self,
+        f: impl FnOnce(
+            &mut TransferGraphSearcher<
+                FastGraphStatic<'static>,
+                SphereIndexMmap<'static, usize>,
+            >,
+        ) -> R,
+    ) -> R {
+        loop {
+            if let Some(mut searcher) = self.pool.lock().unwrap().pop_front() {
+                let result = f(&mut searcher);
+                self.pool.lock().unwrap().push_back(searcher);
+                return result;
+            }
+            std::thread::yield_now();
+        }
+    }
+}
+
+struct HeartbeatProgress {
+    label: &'static str,
+    total: usize,
+    start: Instant,
+    last_log: Mutex<Instant>,
+}
+
+impl HeartbeatProgress {
+    fn new(label: &'static str, total: usize) -> Self {
+        let now = Instant::now();
+        Self {
+            label,
+            total,
+            start: now,
+            last_log: Mutex::new(now),
+        }
+    }
+
+    fn maybe_log(&self, completed: usize) {
+        let now = Instant::now();
+        let mut last_log = self.last_log.lock().unwrap();
+        if completed < self.total && now.duration_since(*last_log) < Duration::from_secs(10) {
+            return;
+        }
+        let pct = if self.total == 0 {
+            100.0
+        } else {
+            (completed as f64 * 100.0) / self.total as f64
+        };
+        let elapsed = self.start.elapsed();
+        if completed > 0 && completed < self.total {
+            let eta = Duration::from_secs_f64(
+                elapsed.as_secs_f64() * (self.total - completed) as f64 / completed as f64,
+            );
+            info!(
+                phase = self.label,
+                completed,
+                total = self.total,
+                percent = pct,
+                elapsed_seconds = elapsed.as_secs_f64(),
+                eta_seconds = eta.as_secs_f64(),
+                "timetable concat progress"
+            );
+        } else {
+            info!(
+                phase = self.label,
+                completed,
+                total = self.total,
+                percent = pct,
+                elapsed_seconds = elapsed.as_secs_f64(),
+                "timetable concat progress"
+            );
+        }
+        *last_log = now;
+    }
+
+    fn maybe_log_stalled(&self, completed: usize, context: &'static str) {
+        let now = Instant::now();
+        let mut last_log = self.last_log.lock().unwrap();
+        if now.duration_since(*last_log) < Duration::from_secs(10) {
+            return;
+        }
+        let pct = if self.total == 0 {
+            100.0
+        } else {
+            (completed as f64 * 100.0) / self.total as f64
+        };
+        let elapsed = self.start.elapsed();
+        info!(
+            phase = self.label,
+            completed,
+            total = self.total,
+            percent = pct,
+            elapsed_seconds = elapsed.as_secs_f64(),
+            context,
+            "timetable concat heartbeat"
+        );
+        *last_log = now;
     }
 }
 
@@ -191,7 +391,7 @@ impl<'a> MmapTimetable<'a> {
         backing_trip_stop_times: Pin<Mmap>,
         backing_transfer_index: Pin<Mmap>,
         backing_transfers: Pin<Mmap>,
-        metadata_db: Database,
+        metadata_db: Option<Database>,
     ) -> Result<MmapTimetable<'a>, anyhow::Error> {
         let routes = unsafe {
             let s = cast_slice::<u8, Route>(&backing_routes);
@@ -290,7 +490,13 @@ impl<'a> MmapTimetable<'a> {
         let transfers = File::open(base_path.join("transfers"))?;
 
         debug!("Opening metadata database");
-        let metadata_db = Database::open(base_path.join("metadata.db"))?;
+        let metadata_db = match Database::open(base_path.join("metadata.db")) {
+            Result::Ok(db) => Some(db),
+            Err(err) => {
+                warn!(error = %err, "Could not open metadata database; continuing without metadata db handle");
+                None
+            }
+        };
 
         let page_bits = Some(21);
 
@@ -442,6 +648,20 @@ impl<'a> MmapTimetable<'a> {
         base_path: &PathBuf,
         valhalla_tile_path: &PathBuf,
     ) -> MmapTimetable<'b> {
+        let skip_to_transfers = base_path.join(".force_skip_to_transfers").exists();
+        let metadata_complete = base_path.join(".metadata.complete").exists();
+        let core_arrays_complete = base_path.join(".core_arrays.complete").exists();
+        if skip_to_transfers || (metadata_complete && core_arrays_complete) {
+            info!(
+                skip_to_transfers,
+                metadata_complete,
+                core_arrays_complete,
+                "Skipping concat metadata/core phase and resuming at transfer generation"
+            );
+            let mut tt = MmapTimetable::open(base_path).unwrap();
+            tt.calculate_transfers(valhalla_tile_path).await.unwrap();
+            return tt;
+        }
         {
             let total_routes: usize = timetables.iter().map(|tt| tt.routes().len()).sum();
             let total_route_stops: usize = timetables.iter().map(|tt| tt.route_stops().len()).sum();
@@ -538,6 +758,8 @@ impl<'a> MmapTimetable<'a> {
                 cast_slice_mut(&mut backing_trip_stop_times);
 
             {
+                let copy_progress = HeartbeatProgress::new("copy_core_arrays", timetables.len());
+                let mut copied = 0usize;
                 // Make mutable copies of the slices.
                 for tt in timetables {
                     let route_slice =
@@ -591,6 +813,8 @@ impl<'a> MmapTimetable<'a> {
                     stop_cursor += tt.stops().len();
                     stop_route_cursor += tt.stop_routes().len();
                     trip_stop_time_cursor += tt.trip_stop_times().len();
+                    copied += 1;
+                    copy_progress.maybe_log(copied);
                 }
             }
             let metadata_db = Database::create(base_path.join("metadata.db")).unwrap();
@@ -599,6 +823,8 @@ impl<'a> MmapTimetable<'a> {
                 {
                     let mut table = write.open_table(STOP_METADATA_TABLE).unwrap();
                     let mut cursor = 0usize;
+                    let progress = HeartbeatProgress::new("write_stop_metadata", timetables.len());
+                    let mut completed = 0usize;
                     for tt in timetables {
                         for stop in tt.stops() {
                             let bytes = rmp_serde::to_vec(&tt.stop_metadata(stop)).unwrap();
@@ -607,6 +833,8 @@ impl<'a> MmapTimetable<'a> {
                                 .unwrap();
                         }
                         cursor += tt.stops().len();
+                        completed += 1;
+                        progress.maybe_log(completed);
                     }
                 }
                 write.commit().unwrap();
@@ -616,6 +844,8 @@ impl<'a> MmapTimetable<'a> {
                 {
                     let mut table = write.open_table(TRIP_METADATA_TABLE).unwrap();
                     let mut cursor = 0usize;
+                    let progress = HeartbeatProgress::new("write_trip_metadata", timetables.len());
+                    let mut completed = 0usize;
                     for tt in timetables {
                         for trip in tt.route_trips() {
                             let bytes = rmp_serde::to_vec(&tt.trip_metadata(trip)).unwrap();
@@ -624,6 +854,8 @@ impl<'a> MmapTimetable<'a> {
                                 .unwrap();
                         }
                         cursor += tt.route_trips().len();
+                        completed += 1;
+                        progress.maybe_log(completed);
                     }
                 }
                 write.commit().unwrap();
@@ -633,6 +865,8 @@ impl<'a> MmapTimetable<'a> {
                 {
                     let mut table = write.open_table(ROUTE_SHAPE_TABLE).unwrap();
                     let mut cursor = 0usize;
+                    let progress = HeartbeatProgress::new("write_route_shapes", timetables.len());
+                    let mut completed = 0usize;
                     for tt in timetables {
                         for route in tt.routes() {
                             let bytes = rmp_serde::to_vec(&tt.route_shape(route)).unwrap();
@@ -641,14 +875,152 @@ impl<'a> MmapTimetable<'a> {
                                 .unwrap();
                         }
                         cursor += tt.routes().len();
+                        completed += 1;
+                        progress.maybe_log(completed);
                     }
                 }
                 write.commit().unwrap();
             }
         }
+        if !base_path.join(".core_arrays.complete").exists() ||
+            !base_path.join(".metadata.complete").exists()
+        {
+            fs::write(base_path.join(".core_arrays.complete"), b"ok").unwrap();
+            fs::write(base_path.join(".metadata.complete"), b"ok").unwrap();
+        }
         let mut tt = MmapTimetable::open(base_path).unwrap();
         tt.calculate_transfers(valhalla_tile_path).await.unwrap();
         tt
+    }
+
+    fn core_arrays_complete_path(&self) -> PathBuf {
+        self.base_path.join(".core_arrays.complete")
+    }
+
+    fn metadata_complete_path(&self) -> PathBuf {
+        self.base_path.join(".metadata.complete")
+    }
+
+    fn force_skip_to_transfers_path(&self) -> PathBuf {
+        self.base_path.join(".force_skip_to_transfers")
+    }
+
+    fn transfer_counts_path(&self) -> PathBuf {
+        self.base_path.join(".transfer_counts.bin")
+    }
+
+    fn transfer_counts_complete_path(&self) -> PathBuf {
+        self.base_path.join(".transfer_counts.complete")
+    }
+
+    fn transfer_data_complete_path(&self) -> PathBuf {
+        self.base_path.join(".transfers.complete")
+    }
+
+    fn compute_and_write_transfers(
+        &self,
+        graph: &Arc<TransferGraph<FastGraphStatic<'static>, SphereIndexMmap<'static, usize>>>,
+    ) -> Result<(), Error> {
+        const TRANSFER_THREADS: usize = 64;
+
+        info!(
+            total_stops = self.stops().len(),
+            transfer_threads = TRANSFER_THREADS,
+            "Computing all transfers in single parallel pass"
+        );
+
+        let pool = ThreadPoolBuilder::new()
+            .num_threads(TRANSFER_THREADS)
+            .build()
+            .map_err(|err| Error::msg(err.to_string()))?;
+
+        let progress = HeartbeatProgress::new("compute_transfers", self.stops().len());
+        let completed = std::sync::atomic::AtomicUsize::new(0);
+
+        // Single parallel pass: compute all transfer matrices
+        let all_transfers: Vec<Vec<Transfer>> = pool.install(|| {
+            self.stops()
+                .par_iter()
+                .map_init(
+                    || TransferGraphSearcher::new(graph.clone()),
+                    |searcher, stop| {
+                        let transfers = self.calculate_transfer_matrix(graph, searcher, stop);
+                        let done = completed.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                        progress.maybe_log(done);
+                        transfers
+                    },
+                )
+                .collect()
+        });
+
+        info!(
+            total_stops = all_transfers.len(),
+            total_transfers = all_transfers.iter().map(|t| t.len()).sum::<usize>(),
+            "Transfer computation complete, writing to disk"
+        );
+
+        // Build offsets from lengths
+        let total_transfers: usize = all_transfers.iter().map(|t| t.len()).sum();
+        let mut offsets = Vec::with_capacity(all_transfers.len());
+        let mut cursor = 0usize;
+        for transfers in &all_transfers {
+            offsets.push(cursor);
+            cursor += transfers.len();
+        }
+
+        // Write transfer_index
+        let transfer_index_file = File::options()
+            .write(true)
+            .read(true)
+            .create(true)
+            .truncate(true)
+            .open(&self.base_path.join("transfer_index"))?;
+        transfer_index_file.set_len((size_of::<usize>() * all_transfers.len()) as u64)?;
+        let mut backing_transfer_index_mut = unsafe { MmapMut::map_mut(&transfer_index_file)? };
+        let out_transfer_index = unsafe {
+            let s = cast_slice_mut::<u8, usize>(&mut backing_transfer_index_mut);
+            slice::from_raw_parts_mut(s.as_mut_ptr(), s.len())
+        };
+        out_transfer_index.copy_from_slice(&offsets);
+
+        // Write transfers
+        let transfer_file = File::options()
+            .write(true)
+            .read(true)
+            .create(true)
+            .truncate(true)
+            .open(&self.base_path.join("transfers"))?;
+        transfer_file.set_len((size_of::<Transfer>() * total_transfers) as u64)?;
+        let mut backing_transfers_mut = unsafe { MmapMut::map_mut(&transfer_file)? };
+        let out_transfers = unsafe {
+            let s = cast_slice_mut::<u8, Transfer>(&mut backing_transfers_mut);
+            slice::from_raw_parts_mut(s.as_mut_ptr(), s.len())
+        };
+
+        for (stop_idx, transfers) in all_transfers.iter().enumerate() {
+            let offset = offsets[stop_idx];
+            out_transfers[offset..offset + transfers.len()].copy_from_slice(transfers);
+        }
+
+        backing_transfer_index_mut.flush()?;
+        backing_transfers_mut.flush()?;
+        fs::write(self.transfer_data_complete_path(), b"ok")?;
+        info!("Transfer generation complete");
+        Ok(())
+    }
+
+    fn has_core_arrays(&self) -> bool {
+        [
+            "routes",
+            "route_stops",
+            "route_trips",
+            "stops",
+            "stop_routes",
+            "trip_stop_times",
+            "metadata.db",
+        ]
+        .iter()
+        .all(|name| self.base_path.join(name).exists())
     }
 
     pub(crate) async fn calculate_transfers(
@@ -670,72 +1042,29 @@ impl<'a> MmapTimetable<'a> {
         }
         assert_eq!(self.stops().len(), self.rtree.size());
 
-        info!("Opening transfer graph");
-        let transfer_graph = Arc::new(
-            TransferGraph::<FastGraphStatic, SphereIndexMmap<usize>>::read_from_dir(
-                valhalla_tile_path.clone(),
-                Arc::new(redb::Database::open(
-                    valhalla_tile_path.join("graph_metadata.db"),
-                )?),
-            )?,
-        );
+        info!("Temporarily closing timetable metadata db before transfer generation");
+        let _closed_metadata_db = self.metadata_db.take();
 
-        info!("Calculating transfer times");
-        let transfers: Vec<Vec<Transfer>> = self
-            .stops()
-            .par_iter()
-            .map_with(
-                TransferGraphSearcher::new(transfer_graph.clone()),
-                |searcher, from_stop| {
-                    self.calculate_transfer_matrix(&transfer_graph, searcher, from_stop)
-                },
-            )
-            .collect();
+        let transfer_result = (|| -> Result<(), Error> {
+            info!("Opening transfer graph");
+            let transfer_graph = Arc::new(
+                TransferGraph::<FastGraphStatic, SphereIndexMmap<usize>>::read_from_dir(
+                    valhalla_tile_path.clone(),
+                    None,
+                )?,
+            );
 
-        let transfer_index_file = File::options()
-            .write(true)
-            .read(true)
-            .create(true)
-            .open(&self.base_path.join("transfer_index"))?;
-        transfer_index_file
-            .set_len((size_of::<usize>() * transfers.len()) as u64)
-            .unwrap();
-        let transfer_file = File::options()
-            .write(true)
-            .read(true)
-            .create(true)
-            .open(&self.base_path.join("transfers"))?;
-        transfer_file
-            .set_len(
-                transfers
-                    .iter()
-                    .map(|t| size_of::<Transfer>() * t.len())
-                    .sum::<usize>() as u64,
-            )
-            .unwrap();
-
-        let mut backing_transfer_index_mut =
-            unsafe { MmapMut::map_mut(&transfer_index_file).unwrap() };
-        let mut backing_transfers_mut = unsafe { MmapMut::map_mut(&transfer_file).unwrap() };
-
-        let out_transfer_index = unsafe {
-            let s = cast_slice_mut::<u8, usize>(&mut backing_transfer_index_mut);
-            slice::from_raw_parts_mut(s.as_mut_ptr(), s.len())
-        };
-        let out_transfers = unsafe {
-            let s = cast_slice_mut::<u8, Transfer>(&mut backing_transfers_mut);
-            slice::from_raw_parts_mut(s.as_mut_ptr(), s.len())
-        };
-
-        let mut total_transfers_processed = 0;
-        for (transfer_chunk_idx, transfers) in transfers.iter().enumerate() {
-            out_transfer_index[transfer_chunk_idx] = total_transfers_processed;
-            for transfer in transfers {
-                out_transfers[total_transfers_processed] = *transfer;
-                total_transfers_processed += 1;
+            if self.transfer_data_complete_path().exists() {
+                info!("Transfer data already complete; skipping");
+                return Ok(());
             }
-        }
-        Ok(())
+
+            self.compute_and_write_transfers(&transfer_graph)?;
+            Ok(())
+        })();
+
+        info!("Leaving timetable metadata db closed after transfer generation");
+        transfer_result
     }
 
     fn generate_transfer_candidates(&self, stop: &Stop) -> Vec<&Stop> {
@@ -753,36 +1082,43 @@ impl<'a> MmapTimetable<'a> {
             if dist > 1000f64 || count > 20 {
                 break;
             }
+            if to_stop.id == stop.id() as usize {
+                continue;
+            }
             transfer_candidates.push(self.stop(to_stop.id));
         }
         transfer_candidates
     }
 
-    fn calculate_transfer_matrix<G: FastGraph, I: SphereIndex<usize>>(
+    fn calculate_transfer_matrix(
         &self,
-        graph: &TransferGraph<G, I>,
-        search_context: &mut TransferGraphSearcher<G, I>,
+        graph: &TransferGraph<FastGraphStatic<'static>, SphereIndexMmap<'static, usize>>,
+        search_context: &mut TransferGraphSearcher<
+            FastGraphStatic<'static>,
+            SphereIndexMmap<'static, usize>,
+        >,
         stop: &Stop,
     ) -> Vec<Transfer> {
+        let from_location = stop.location();
+        let from_coords = Self::location_to_coords(&from_location);
         let transfer_candidates = self.generate_transfer_candidates(stop);
-        transfer_candidates
-            .iter()
-            .filter_map(|to_stop| {
-                let transfer_time = graph
-                    .transfer_distance_mm(
-                        search_context,
-                        &Self::location_to_coords(&stop.location()),
-                        &Self::location_to_coords(&to_stop.location()),
-                    )
-                    .ok()?
-                    / WALK_SPEED_MM_PER_SECOND;
-                Some(Transfer {
-                    to: to_stop.id(),
-                    from: stop.id(),
-                    time: transfer_time,
-                })
-            })
-            .collect()
+
+        let mut out = Vec::with_capacity(transfer_candidates.len());
+        for to_stop in transfer_candidates {
+            let to_location = to_stop.location();
+            let to_coords = Self::location_to_coords(&to_location);
+            let transfer_time = graph.transfer_distance_mm(search_context, &from_coords, &to_coords);
+            let transfer_time = match transfer_time {
+                Result::Ok(transfer_time) => transfer_time,
+                Err(_) => continue,
+            };
+            out.push(Transfer {
+                to: to_stop.id(),
+                from: stop.id(),
+                time: transfer_time / WALK_SPEED_MM_PER_SECOND,
+            });
+        }
+        out
     }
 
     fn location_to_coords(location: &LatLng) -> Coord {

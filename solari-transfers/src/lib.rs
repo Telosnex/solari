@@ -1,10 +1,12 @@
+mod builder;
 pub mod valinor;
 pub use fast_paths;
+pub use builder::{PreparedTransferGraph, TransferGraphBuildArtifacts};
 use redb::{Database, ReadableTable, TableDefinition, WriteTransaction};
 
 use std::{
     collections::HashMap,
-    fs::File,
+    fs::{self, File},
     path::PathBuf,
     pin::Pin,
     sync::{Arc, RwLock},
@@ -14,7 +16,7 @@ use crate::valinor::edge_export::enumerate_edges;
 use anyhow::{Ok, bail};
 use fast_paths::{
     FastGraph, FastGraphBuilder, FastGraphStatic, FastGraphVec, InputGraph, PathCalculator,
-    create_calculator,
+    SparseWeightCalculator, create_calculator,
 };
 use geo::{Coord, Geodesic, Length, LineString};
 use log::{error, info};
@@ -22,15 +24,15 @@ use memmap2::MmapOptions;
 use solari_spatial::{IndexedPoint, SphereIndex, SphereIndexMmap, SphereIndexVec};
 use valhalla_graphtile::{Access, GraphId};
 
-const EDGE_SHAPE_TABLE: TableDefinition<(u64, u64), &[u8]> =
+pub(crate) const EDGE_SHAPE_TABLE: TableDefinition<(u64, u64), &[u8]> =
     TableDefinition::new("valhalla_edge_shapes");
-const EDGE_LENGTH_TABLE: TableDefinition<(u64, u64), f64> =
+pub(crate) const EDGE_LENGTH_TABLE: TableDefinition<(u64, u64), f64> =
     TableDefinition::new("valhalla_edge_lengths");
 
 pub struct TransferGraph<G: FastGraph, I: SphereIndex<usize>> {
     node_index: I,
     graph: G,
-    database: Arc<redb::Database>,
+    database: Option<Arc<redb::Database>>,
 }
 
 impl<G: FastGraph, I: SphereIndex<usize>> TransferGraph<G, I> {
@@ -126,12 +128,13 @@ impl<G: FastGraph, I: SphereIndex<usize>> TransferGraph<G, I> {
         Ok(TransferGraph {
             node_index,
             graph,
-            database,
+            database: Some(database),
         })
     }
 
     pub fn save_to_dir(&self, dir: PathBuf) -> Result<(), anyhow::Error> {
         info!("writing transfer graph files to {}", dir.display());
+        fs::create_dir_all(&dir)?;
         self.graph.save_static(dir.join("transfer_graph.bin"))?;
         self.node_index
             .write_to_file(dir.join("transfer_node_index.bin"))?;
@@ -141,7 +144,7 @@ impl<G: FastGraph, I: SphereIndex<usize>> TransferGraph<G, I> {
 
     pub fn read_from_dir<'a>(
         dir: PathBuf,
-        database: Arc<Database>,
+        database: Option<Arc<Database>>,
     ) -> Result<TransferGraph<FastGraphStatic<'a>, SphereIndexMmap<'a, usize>>, anyhow::Error> {
         let graph_file = File::open(dir.join("transfer_graph.bin"))?;
         let graph_mmap = unsafe { MmapOptions::new().map(&graph_file)? };
@@ -168,10 +171,14 @@ impl<G: FastGraph, I: SphereIndex<usize>> TransferGraph<G, I> {
         let from = self.get_nearest_nodes(from);
         let to = self.get_nearest_nodes(to);
         if let Some(path) = search_context
-            .calculator
+            .ensure_path_calculator()
             .calc_path_multiple_sources_and_targets(&self.graph, from, to)
         {
-            let txn = self.database.begin_read()?;
+            let database = self
+                .database
+                .as_ref()
+                .ok_or(anyhow::anyhow!("transfer graph metadata db not open"))?;
+            let txn = database.begin_read()?;
             let shapes = txn.open_table(EDGE_SHAPE_TABLE)?;
             let mut path_shape: Vec<Coord<f64>> = Vec::new();
             for pair in path.get_nodes().windows(2) {
@@ -203,11 +210,11 @@ impl<G: FastGraph, I: SphereIndex<usize>> TransferGraph<G, I> {
     ) -> Result<u64, anyhow::Error> {
         let from = self.get_nearest_nodes(from);
         let to = self.get_nearest_nodes(to);
-        if let Some(path) = search_context
-            .calculator
-            .calc_path_multiple_sources_and_targets(&self.graph, from, to)
+        if let Some(weight) = search_context
+            .weight_calculator
+            .calc_weight_multiple_sources_and_targets(&self.graph, from, to)
         {
-            return Ok(path.get_weight() as u64);
+            return Ok(weight as u64);
         } else {
             bail!("No route")
         }
@@ -236,20 +243,24 @@ impl<G: FastGraph, I: SphereIndex<usize>> TransferGraph<G, I> {
         shape: &LineString,
     ) -> Result<bool, anyhow::Error> {
         let key = (from, to);
-        let lengths = txn.open_table(EDGE_LENGTH_TABLE)?;
-        let should_insert_shape = if let Some(previous_len) = lengths.get(&key)? {
-            if length < previous_len.value() {
-                true
+        let should_insert_shape = {
+            let lengths = txn.open_table(EDGE_LENGTH_TABLE)?;
+            if let Some(previous_len) = lengths.get(&key)? {
+                if length < previous_len.value() {
+                    true
+                } else {
+                    false
+                }
             } else {
-                false
+                true
             }
-        } else {
-            true
         };
         if !should_insert_shape {
             return Ok(false);
         }
         let polyline = polyline::encode_coordinates(shape.0.clone(), 5)?;
+        let mut lengths = txn.open_table(EDGE_LENGTH_TABLE)?;
+        lengths.insert(&key, length)?;
         let mut shapes = txn.open_table(EDGE_SHAPE_TABLE)?;
         shapes.insert(&key, polyline.as_bytes())?;
         Ok(true)
@@ -269,6 +280,10 @@ impl<G: FastGraph, I: SphereIndex<usize>> TransferGraph<G, I> {
             })
             .collect()
     }
+
+    pub fn debug_nearest_node_count(&self, coord: &Coord) -> usize {
+        self.get_nearest_nodes(coord).len()
+    }
 }
 
 pub struct TransferPath {
@@ -277,23 +292,33 @@ pub struct TransferPath {
 }
 
 pub struct TransferGraphSearcher<G: FastGraph, I: SphereIndex<usize>> {
-    calculator: PathCalculator,
+    weight_calculator: SparseWeightCalculator,
+    path_calculator: Option<PathCalculator>,
     graph: Arc<TransferGraph<G, I>>,
 }
 
 impl<G: FastGraph, I: SphereIndex<usize>> TransferGraphSearcher<G, I> {
     pub fn new(graph: Arc<TransferGraph<G, I>>) -> TransferGraphSearcher<G, I> {
         TransferGraphSearcher {
-            calculator: create_calculator(&graph.graph),
+            weight_calculator: SparseWeightCalculator::new(graph.graph.get_num_nodes()),
+            path_calculator: None,
             graph,
         }
+    }
+
+    fn ensure_path_calculator(&mut self) -> &mut PathCalculator {
+        if self.path_calculator.is_none() {
+            self.path_calculator = Some(create_calculator(&self.graph.graph));
+        }
+        self.path_calculator.as_mut().unwrap()
     }
 }
 
 impl<G: FastGraph, I: SphereIndex<usize>> Clone for TransferGraphSearcher<G, I> {
     fn clone(&self) -> Self {
         Self {
-            calculator: create_calculator(&self.graph.graph),
+            weight_calculator: SparseWeightCalculator::new(self.graph.graph.get_num_nodes()),
+            path_calculator: None,
             graph: self.graph.clone(),
         }
     }
