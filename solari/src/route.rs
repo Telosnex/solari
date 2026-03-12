@@ -1230,6 +1230,7 @@ where
     }
 
     async fn do_round(&mut self, round: u32) -> bool {
+        let round_start = std::time::Instant::now();
         let mut marked_stops_total = 0usize;
 
         {
@@ -1451,13 +1452,22 @@ where
                 }
             }
             debug!("Marked {} new stops", marked_stops_count);
+            let route_scan_elapsed = round_start.elapsed();
             marked_stops_total += marked_stops_count;
 
             if marked_stops_count == 0 {
+                info!(
+                    round = round,
+                    marked_stops = 0,
+                    route_scan_ms = route_scan_elapsed.as_millis() as u64,
+                    total_steps = self.step_log.len(),
+                    "round: no new stops, skipping transfers"
+                );
                 return false;
             }
         }
 
+        let transfer_start = std::time::Instant::now();
         let mut marked_transfers_count = 0usize;
         let mut total_transfers_count = 0usize;
         let marked_stops = self.marked_stops[round as usize].clone();
@@ -1523,9 +1533,18 @@ where
                 }
             }
         }
-        debug!(
-            "Marked {} of {} transfers.",
-            marked_transfers_count, total_transfers_count
+        let transfer_elapsed = transfer_start.elapsed();
+        let round_elapsed = round_start.elapsed();
+        info!(
+            round = round,
+            marked_stops = marked_stops_total,
+            marked_transfers = marked_transfers_count,
+            total_transfers_evaluated = total_transfers_count,
+            route_scan_ms = (round_elapsed - transfer_elapsed).as_millis() as u64,
+            transfer_ms = transfer_elapsed.as_millis() as u64,
+            round_ms = round_elapsed.as_millis() as u64,
+            total_steps = self.step_log.len(),
+            "round: complete"
         );
 
         marked_stops_total > 0 || marked_transfers_count > 0
