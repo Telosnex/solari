@@ -3,10 +3,11 @@ use std::path::PathBuf;
 use clap::Parser;
 use rocket::{State, serde::json::Json};
 use s2::latlng::LatLng;
+use serde::Serialize;
 use solari::{
     api::{request::SolariRequest, response::SolariResponse},
     route::Router,
-    timetable::{Time, mmap::MmapTimetable},
+    timetable::{Time, Timetable, mmap::MmapTimetable},
 };
 use time::OffsetDateTime;
 use tracing_subscriber::FmtSubscriber;
@@ -55,6 +56,68 @@ async fn plan(
     Json(response)
 }
 
+#[derive(Debug, Serialize)]
+struct DebugStop {
+    id: usize,
+    name: String,
+    lat: f64,
+    lon: f64,
+    transfer_count: usize,
+    transfers_to: Vec<DebugTransfer>,
+}
+
+#[derive(Debug, Serialize)]
+struct DebugTransfer {
+    to_stop_id: usize,
+    to_stop_name: String,
+    to_lat: f64,
+    to_lon: f64,
+    duration_seconds: u32,
+}
+
+#[get("/debug/stops?<lat>&<lon>&<radius>&<max_stops>")]
+fn debug_stops(
+    lat: f64,
+    lon: f64,
+    radius: Option<f64>,
+    max_stops: Option<usize>,
+    router: &State<Router<'_, MmapTimetable<'_>>>,
+) -> Json<Vec<DebugStop>> {
+    let location = LatLng::from_degrees(lat, lon);
+    let nearby = router.nearest_stops(
+        location,
+        Some(max_stops.unwrap_or(100)),
+        radius,
+    );
+    let timetable = router.timetable();
+    let mut stops = Vec::new();
+    for stop in &nearby {
+        let stop_id = stop.id();
+        let transfers = timetable.transfers_from(stop_id);
+        let transfers_to: Vec<DebugTransfer> = transfers.iter().map(|t| {
+            let to_stop = t.to(timetable);
+            let to_loc = to_stop.location();
+            DebugTransfer {
+                to_stop_id: to_stop.id(),
+                to_stop_name: to_stop.metadata(timetable).name.clone().unwrap_or_default(),
+                to_lat: to_loc.lat.deg(),
+                to_lon: to_loc.lng.deg(),
+                duration_seconds: t.time_seconds(),
+            }
+        }).collect();
+        let loc = stop.location();
+        stops.push(DebugStop {
+            id: stop_id,
+            name: stop.metadata(timetable).name.clone().unwrap_or_default(),
+            lat: loc.lat.deg(),
+            lon: loc.lng.deg(),
+            transfer_count: transfers.len(),
+            transfers_to,
+        });
+    }
+    Json(stops)
+}
+
 #[derive(Parser)]
 struct ServeArgs {
     #[arg(long)]
@@ -80,5 +143,5 @@ fn rocket() -> _ {
     rocket::build()
         .manage(router)
         .configure(rocket::Config::figment().merge(("port", args.port.unwrap_or(8000))).merge(("address", "0.0.0.0")))
-        .mount("/", routes![plan])
+        .mount("/", routes![plan, debug_stops])
 }

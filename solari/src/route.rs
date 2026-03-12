@@ -52,6 +52,10 @@ impl<'a, T: Timetable<'a>> Router<'a, T> {
         })
     }
 
+    pub fn timetable(&'a self) -> &'a T {
+        &self.timetable
+    }
+
     pub fn nearest_stops(
         &'a self,
         location: LatLng,

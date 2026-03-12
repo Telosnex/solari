@@ -3077,6 +3077,7 @@ dependencies = [
  "clap",
  "rocket",
  "s2",
+ "serde",
  "solari",
  "time",
  "tokio",
