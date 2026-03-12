@@ -145,7 +145,7 @@ pub async fn prepare_timetables_from_feeds<'a>(
         .count();
     let progress = FeedProgressReporter::new(total);
 
-    let shard_dirs: Vec<PathBuf> = paths
+    let mut shard_dirs: Vec<PathBuf> = paths
         .par_iter()
         .filter(|path| path.extension().map(|ext| ext == "zip") == Some(true))
         .filter_map(|path| {
@@ -170,6 +170,7 @@ pub async fn prepare_timetables_from_feeds<'a>(
         })
         .collect();
 
+    shard_dirs.sort();
     Ok(shard_dirs)
 }
 
