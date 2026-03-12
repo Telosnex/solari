@@ -142,10 +142,11 @@ impl<'a> Timetable<'a> for MmapTimetable<'a> {
     }
 
     fn stop_metadata(&'a self, stop: &Stop) -> gtfs_structures::Stop {
-        let table = self
-            .metadata_db
-            .as_ref()
-            .expect("metadata db not open")
+        let db = match self.metadata_db.as_ref() {
+            Some(db) => db,
+            None => return gtfs_structures::Stop::default(),
+        };
+        let table = db
             .begin_read()
             .expect("Read failed")
             .open_table(STOP_METADATA_TABLE)
@@ -159,10 +160,11 @@ impl<'a> Timetable<'a> for MmapTimetable<'a> {
     }
 
     fn trip_metadata(&'a self, trip: &Trip) -> TripMetadata {
-        let table = self
-            .metadata_db
-            .as_ref()
-            .expect("metadata db not open")
+        let db = match self.metadata_db.as_ref() {
+            Some(db) => db,
+            None => return TripMetadata::default(),
+        };
+        let table = db
             .begin_read()
             .expect("Read failed")
             .open_table(TRIP_METADATA_TABLE)
@@ -176,10 +178,11 @@ impl<'a> Timetable<'a> for MmapTimetable<'a> {
     }
 
     fn route_shape(&'a self, route: &Route) -> Option<Vec<ShapeCoordinate>> {
-        let table = self
-            .metadata_db
-            .as_ref()
-            .expect("metadata db not open")
+        let db = match self.metadata_db.as_ref() {
+            Some(db) => db,
+            None => return None,
+        };
+        let table = db
             .begin_read()
             .expect("Read failed")
             .open_table(ROUTE_SHAPE_TABLE)

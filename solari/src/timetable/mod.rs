@@ -144,7 +144,7 @@ impl<'a> Trip {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct TripMetadata {
     pub headsign: Option<String>,
     pub route_name: Option<String>,
