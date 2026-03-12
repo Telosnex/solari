@@ -366,6 +366,10 @@ impl PathCalculator {
             }
         }
 
+        let mut settled_fwd: usize = 0;
+        let mut settled_bwd: usize = 0;
+        let mut max_weight_fwd: Weight = 0;
+        let mut max_weight_bwd: Weight = 0;
         loop {
             if self.heap_fwd.is_empty() && self.heap_bwd.is_empty() {
                 break;
@@ -397,6 +401,8 @@ impl PathCalculator {
                     }
                 }
                 self.data_fwd[curr.node_id].settled = true;
+                settled_fwd += 1;
+                if curr.weight > max_weight_fwd { max_weight_fwd = curr.weight; }
                 if self.valid_flags_bwd.is_valid(curr.node_id)
                     && curr.weight + self.get_weight_bwd(curr.node_id) < best_weight
                 {
@@ -433,6 +439,8 @@ impl PathCalculator {
                     }
                 }
                 self.data_bwd[curr.node_id].settled = true;
+                settled_bwd += 1;
+                if curr.weight > max_weight_bwd { max_weight_bwd = curr.weight; }
                 if self.valid_flags_fwd.is_valid(curr.node_id)
                     && curr.weight + self.get_weight_fwd(curr.node_id) < best_weight
                 {
@@ -443,6 +451,8 @@ impl PathCalculator {
             }
         }
 
+        eprintln!("path_calculator: settled_fwd={} settled_bwd={} max_weight_fwd={}m max_weight_bwd={}m found={}",
+            settled_fwd, settled_bwd, max_weight_fwd / 1000, max_weight_bwd / 1000, meeting_node != INVALID_NODE);
         if meeting_node == INVALID_NODE {
             None
         } else {
