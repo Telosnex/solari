@@ -42,7 +42,7 @@ impl<'a, T: Timetable<'a>> Router<'a, T> {
         let transfer_graph = Arc::new(
             TransferGraph::<FastGraphStatic, SphereIndexMmap<usize>>::read_from_dir(
                 transfer_graph_path.clone(),
-                database,
+                Some(database),
             )?,
         );
         info!("Built router");
@@ -102,6 +102,36 @@ impl<'a, T: Timetable<'a>> Router<'a, T> {
             max_distance_meters,
         );
 
+        info!(
+            start_lat = start_location.lat.deg(),
+            start_lng = start_location.lng.deg(),
+            target_lat = target_location.lat.deg(),
+            target_lng = target_location.lng.deg(),
+            start_stops = start_stops.len(),
+            target_stops = target_stops.len(),
+            max_distance_meters = ?max_distance_meters,
+            max_candidate_stops = ?max_candidate_stops_each_side,
+            "route: nearest stops found"
+        );
+        if !start_stops.is_empty() {
+            let first = start_stops[0];
+            info!(
+                stop_name = ?first.metadata(&self.timetable).name,
+                stop_lat = first.location().lat.deg(),
+                stop_lng = first.location().lng.deg(),
+                "route: first start stop"
+            );
+        }
+        if !target_stops.is_empty() {
+            let first = target_stops[0];
+            info!(
+                stop_name = ?first.metadata(&self.timetable).name,
+                stop_lat = first.location().lat.deg(),
+                stop_lng = first.location().lng.deg(),
+                "route: first target stop"
+            );
+        }
+
         let target_costs: Vec<(usize, u32)> = target_stops
             .iter()
             .map(|stop| {
@@ -137,6 +167,21 @@ impl<'a, T: Timetable<'a>> Router<'a, T> {
             .init(route_start_time, start_location, &start_stops)
             .await;
         context.route().await;
+
+        let rounds_used = context.best_times_per_round.len();
+        let targets_reached = target_costs
+            .iter()
+            .filter(|(id, _)| {
+                context.best_times_per_round.iter().any(|round| round[*id].is_some())
+            })
+            .count();
+        info!(
+            rounds_used = rounds_used,
+            targets_reached = targets_reached,
+            total_targets = target_costs.len(),
+            total_steps = context.step_log.len(),
+            "route: RAPTOR complete"
+        );
 
         let best_itineraries = self
             .pick_best_itineraries(&context, &target_costs)

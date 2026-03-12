@@ -5,4 +5,5 @@ log
 profile.json
 *.tt
 /timetable
-/feeds
+/feeds_scratch/
+.DS_Store
