@@ -686,6 +686,15 @@ impl<'a> MmapTimetable<'a> {
             tt.calculate_transfers(valhalla_tile_path).await.unwrap();
             return tt;
         }
+        // If core arrays exist but metadata needs refresh, just redo metadata.
+        if core_arrays_complete && !metadata_complete {
+            info!("Core arrays complete but metadata missing; regenerating metadata only");
+            Self::write_metadata(timetables, base_path);
+            fs::write(base_path.join(".metadata.complete"), b"ok").unwrap();
+            let mut tt = MmapTimetable::open(base_path).unwrap();
+            tt.calculate_transfers(valhalla_tile_path).await.unwrap();
+            return tt;
+        }
         {
             let total_routes: usize = timetables.iter().map(|tt| tt.routes().len()).sum();
             let total_route_stops: usize = timetables.iter().map(|tt| tt.route_stops().len()).sum();
@@ -841,70 +850,7 @@ impl<'a> MmapTimetable<'a> {
                     copy_progress.maybe_log(copied);
                 }
             }
-            let metadata_db = Database::create(base_path.join("metadata.db")).unwrap();
-            {
-                let write = metadata_db.begin_write().unwrap();
-                {
-                    let mut table = write.open_table(STOP_METADATA_TABLE).unwrap();
-                    let mut cursor = 0usize;
-                    let progress = HeartbeatProgress::new("write_stop_metadata", timetables.len());
-                    let mut completed = 0usize;
-                    for tt in timetables {
-                        for stop in tt.stops() {
-                            let bytes = rmp_serde::to_vec(&tt.stop_metadata(stop)).unwrap();
-                            table
-                                .insert((cursor + stop.id()) as u64, bytes.as_slice())
-                                .unwrap();
-                        }
-                        cursor += tt.stops().len();
-                        completed += 1;
-                        progress.maybe_log(completed);
-                    }
-                }
-                write.commit().unwrap();
-            }
-            {
-                let write = metadata_db.begin_write().unwrap();
-                {
-                    let mut table = write.open_table(TRIP_METADATA_TABLE).unwrap();
-                    let mut cursor = 0usize;
-                    let progress = HeartbeatProgress::new("write_trip_metadata", timetables.len());
-                    let mut completed = 0usize;
-                    for tt in timetables {
-                        for trip in tt.route_trips() {
-                            let bytes = rmp_serde::to_vec(&tt.trip_metadata(trip)).unwrap();
-                            table
-                                .insert((cursor + trip.trip_index) as u64, bytes.as_slice())
-                                .unwrap();
-                        }
-                        cursor += tt.route_trips().len();
-                        completed += 1;
-                        progress.maybe_log(completed);
-                    }
-                }
-                write.commit().unwrap();
-            }
-            {
-                let write = metadata_db.begin_write().unwrap();
-                {
-                    let mut table = write.open_table(ROUTE_SHAPE_TABLE).unwrap();
-                    let mut cursor = 0usize;
-                    let progress = HeartbeatProgress::new("write_route_shapes", timetables.len());
-                    let mut completed = 0usize;
-                    for tt in timetables {
-                        for route in tt.routes() {
-                            let bytes = rmp_serde::to_vec(&tt.route_shape(route)).unwrap();
-                            table
-                                .insert((cursor + route.route_index) as u64, bytes.as_slice())
-                                .unwrap();
-                        }
-                        cursor += tt.routes().len();
-                        completed += 1;
-                        progress.maybe_log(completed);
-                    }
-                }
-                write.commit().unwrap();
-            }
+            Self::write_metadata(timetables, base_path);
         }
         if !base_path.join(".core_arrays.complete").exists() ||
             !base_path.join(".metadata.complete").exists()
@@ -915,6 +861,74 @@ impl<'a> MmapTimetable<'a> {
         let mut tt = MmapTimetable::open(base_path).unwrap();
         tt.calculate_transfers(valhalla_tile_path).await.unwrap();
         tt
+    }
+
+    fn write_metadata<'b>(timetables: &[MmapTimetable<'b>], base_path: &PathBuf) {
+        let metadata_db = Database::create(base_path.join("metadata.db")).unwrap();
+        {
+            let write = metadata_db.begin_write().unwrap();
+            {
+                let mut table = write.open_table(STOP_METADATA_TABLE).unwrap();
+                let mut cursor = 0usize;
+                let progress = HeartbeatProgress::new("write_stop_metadata", timetables.len());
+                let mut completed = 0usize;
+                for tt in timetables {
+                    for stop in tt.stops() {
+                        let bytes = rmp_serde::to_vec(&tt.stop_metadata(stop)).unwrap();
+                        table
+                            .insert((cursor + stop.id()) as u64, bytes.as_slice())
+                            .unwrap();
+                    }
+                    cursor += tt.stops().len();
+                    completed += 1;
+                    progress.maybe_log(completed);
+                }
+            }
+            write.commit().unwrap();
+        }
+        {
+            let write = metadata_db.begin_write().unwrap();
+            {
+                let mut table = write.open_table(TRIP_METADATA_TABLE).unwrap();
+                let mut cursor = 0usize;
+                let progress = HeartbeatProgress::new("write_trip_metadata", timetables.len());
+                let mut completed = 0usize;
+                for tt in timetables {
+                    for trip in tt.route_trips() {
+                        let bytes = rmp_serde::to_vec(&tt.trip_metadata(trip)).unwrap();
+                        table
+                            .insert((cursor + trip.trip_index) as u64, bytes.as_slice())
+                            .unwrap();
+                    }
+                    cursor += tt.route_trips().len();
+                    completed += 1;
+                    progress.maybe_log(completed);
+                }
+            }
+            write.commit().unwrap();
+        }
+        {
+            let write = metadata_db.begin_write().unwrap();
+            {
+                let mut table = write.open_table(ROUTE_SHAPE_TABLE).unwrap();
+                let mut cursor = 0usize;
+                let progress = HeartbeatProgress::new("write_route_shapes", timetables.len());
+                let mut completed = 0usize;
+                for tt in timetables {
+                    for route in tt.routes() {
+                        let bytes = rmp_serde::to_vec(&tt.route_shape(route)).unwrap();
+                        table
+                            .insert((cursor + route.route_index) as u64, bytes.as_slice())
+                            .unwrap();
+                    }
+                    cursor += tt.routes().len();
+                    completed += 1;
+                    progress.maybe_log(completed);
+                }
+            }
+            write.commit().unwrap();
+        }
+        info!("Metadata write complete");
     }
 
     fn core_arrays_complete_path(&self) -> PathBuf {
