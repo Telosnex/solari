@@ -34,7 +34,7 @@ async fn plan(
                 Some(1500f64),
                 Some(1000),
                 Some(max_transfers),
-                Some(2),
+                Some(3),
             )
             .await
     } else {
@@ -48,7 +48,7 @@ async fn plan(
                 Some(1500f64),
                 Some(1000),
                 Some(max_transfers),
-                Some(2),
+                Some(3),
             )
             .await
     };
