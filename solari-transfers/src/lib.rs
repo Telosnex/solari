@@ -174,13 +174,17 @@ impl<G: FastGraph, I: SphereIndex<usize>> TransferGraph<G, I> {
         let from = self.get_nearest_nodes(from);
         let to = self.get_nearest_nodes(to);
         let t1 = std::time::Instant::now();
+        let from_unique: std::collections::HashSet<usize> = from.iter().map(|(id, _)| *id).collect();
+        let to_unique: std::collections::HashSet<usize> = to.iter().map(|(id, _)| *id).collect();
         tracing::info!(
             from_lat = from_coord.y,
             from_lon = from_coord.x,
             to_lat = to_coord.y,
             to_lon = to_coord.x,
             from_nodes = from.len(),
+            from_unique = from_unique.len(),
             to_nodes = to.len(),
+            to_unique = to_unique.len(),
             "transfer_path inputs"
         );
         if let Some(path) = search_context
