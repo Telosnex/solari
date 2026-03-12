@@ -118,6 +118,42 @@ fn debug_stops(
     Json(stops)
 }
 
+#[derive(Debug, Serialize)]
+struct NearbyStop {
+    id: usize,
+    name: String,
+    lat: f64,
+    lon: f64,
+    distance_m: f64,
+}
+
+#[get("/v1/nearby_stops?<lat>&<lon>&<radius>")]
+fn nearby_stops(
+    lat: f64,
+    lon: f64,
+    radius: Option<f64>,
+    router: &State<Router<'_, MmapTimetable<'_>>>,
+) -> Json<Vec<NearbyStop>> {
+    let radius = radius.unwrap_or(1000.0);
+    let timetable = router.timetable();
+    let results = timetable.nearest_stops(lat, lon, 5000);
+    let mut stops = Vec::new();
+    for (stop, dist) in &results {
+        if *dist > radius {
+            break;
+        }
+        let loc = stop.location();
+        stops.push(NearbyStop {
+            id: stop.id(),
+            name: stop.metadata(timetable).name.clone().unwrap_or_default(),
+            lat: loc.lat.deg(),
+            lon: loc.lng.deg(),
+            distance_m: *dist,
+        });
+    }
+    Json(stops)
+}
+
 #[derive(Parser)]
 struct ServeArgs {
     #[arg(long)]
@@ -143,5 +179,5 @@ fn rocket() -> _ {
     rocket::build()
         .manage(router)
         .configure(rocket::Config::figment().merge(("port", args.port.unwrap_or(8000))).merge(("address", "0.0.0.0")))
-        .mount("/", routes![plan, debug_stops])
+        .mount("/", routes![plan, debug_stops, nearby_stops])
 }
