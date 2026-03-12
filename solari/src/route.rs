@@ -313,18 +313,23 @@ impl<'a, T: Timetable<'a>> Router<'a, T> {
                 "route: RAPTOR complete"
             );
 
-            let best_itineraries = self
-                .pick_best_itineraries(&context, &target_costs)
+            let picked = self.pick_best_itineraries(&context, &target_costs);
+            info!(count = picked.len(), "route: picked best itineraries");
+            let best_itineraries = picked
                 .iter()
-                .map(|itinerary| {
-                    self.unwind_itinerary(
+                .enumerate()
+                .map(|(idx, itinerary)| {
+                    let start = std::time::Instant::now();
+                    let result = self.unwind_itinerary(
                         &context,
                         itinerary,
                         route_start_time,
                         &target_costs,
                         start_location,
                         target_location,
-                    )
+                    );
+                    info!(idx = idx, elapsed_ms = start.elapsed().as_millis() as u64, legs = result.legs.len(), "route: unwound itinerary");
+                    result
                 })
                 .collect();
 

@@ -1082,7 +1082,7 @@ impl<'a> MmapTimetable<'a> {
             .enumerate()
         {
             let dist = dist_sq.sqrt();
-            if dist > 1000f64 || count > 20 {
+            if dist > 1000f64 {
                 break;
             }
             if to_stop.id == stop.id() as usize {
