@@ -272,7 +272,13 @@ pub struct Transfer {
 
 impl<'a> Transfer {
     pub fn all_transfers(from: &Stop, timetable: &'a dyn Timetable<'a>) -> &'a [Transfer] {
+        if timetable.transfer_index().is_empty() || timetable.transfers().is_empty() {
+            return &[];
+        }
         let from = from.stop_index;
+        if from >= timetable.transfer_index().len() {
+            return &[];
+        }
         let range_end = if from == timetable.transfer_index().len() - 1 {
             timetable.transfers().len()
         } else {
