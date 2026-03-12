@@ -358,6 +358,27 @@ impl HeartbeatProgress {
         *last_log = now;
     }
 
+    fn maybe_log_with_extra(&self, completed: usize, extra: &str) {
+        let mut last = self.last_log.lock().unwrap();
+        if last.elapsed() < Duration::from_secs(10) {
+            return;
+        }
+        *last = Instant::now();
+        let elapsed = self.start.elapsed().as_secs_f64();
+        let rate = completed as f64 / elapsed;
+        let remaining = (self.total - completed) as f64 / rate;
+        info!(
+            phase = self.label,
+            completed = completed,
+            total = self.total,
+            percent = completed as f64 / self.total as f64 * 100.0,
+            elapsed_seconds = elapsed,
+            eta_seconds = remaining,
+            extra = %extra,
+            "timetable concat progress"
+        );
+    }
+
     fn maybe_log_stalled(&self, completed: usize, context: &'static str) {
         let now = Instant::now();
         let mut last_log = self.last_log.lock().unwrap();
@@ -939,6 +960,8 @@ impl<'a> MmapTimetable<'a> {
 
         let progress = HeartbeatProgress::new("compute_transfers", self.stops().len());
         let completed = std::sync::atomic::AtomicUsize::new(0);
+        let total_candidates = std::sync::atomic::AtomicUsize::new(0);
+        let max_candidates = std::sync::atomic::AtomicUsize::new(0);
 
         // Single parallel pass: compute all transfer matrices
         let all_transfers: Vec<Vec<Transfer>> = pool.install(|| {
@@ -948,8 +971,15 @@ impl<'a> MmapTimetable<'a> {
                     || TransferGraphSearcher::new(graph.clone()),
                     |searcher, stop| {
                         let transfers = self.calculate_transfer_matrix(graph, searcher, stop);
+                        let n = transfers.len();
+                        total_candidates.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+                        max_candidates.fetch_max(n, std::sync::atomic::Ordering::Relaxed);
                         let done = completed.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-                        progress.maybe_log(done);
+                        progress.maybe_log_with_extra(done, &format!(
+                            "avg_transfers={:.1} max_transfers={}",
+                            total_candidates.load(std::sync::atomic::Ordering::Relaxed) as f64 / done as f64,
+                            max_candidates.load(std::sync::atomic::Ordering::Relaxed),
+                        ));
                         transfers
                     },
                 )
