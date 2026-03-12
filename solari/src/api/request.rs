@@ -33,13 +33,45 @@ pub struct SolariRequest {
     pub from: LatLng,
     pub to: LatLng,
     #[serde(
-        serialize_with = "time::serde::timestamp::milliseconds::serialize",
-        deserialize_with = "time::serde::timestamp::milliseconds::deserialize"
+        default,
+        serialize_with = "serialize_optional_millis",
+        deserialize_with = "deserialize_optional_millis",
+        skip_serializing_if = "Option::is_none"
     )]
-    pub start_at: OffsetDateTime,
+    pub start_at: Option<OffsetDateTime>,
+
+    #[serde(
+        default,
+        serialize_with = "serialize_optional_millis",
+        deserialize_with = "deserialize_optional_millis",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub end_at: Option<OffsetDateTime>,
 
     #[serde(default)]
     pub transfer_mode: TransferMode,
     #[serde(default)]
     pub max_transfers: TransferQuantity,
+}
+
+fn serialize_optional_millis<S: serde::Serializer>(
+    value: &Option<OffsetDateTime>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    match value {
+        Some(dt) => time::serde::timestamp::milliseconds::serialize(dt, serializer),
+        None => serializer.serialize_none(),
+    }
+}
+
+fn deserialize_optional_millis<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<OffsetDateTime>, D::Error> {
+    let opt: Option<i64> = Option::deserialize(deserializer)?;
+    match opt {
+        Some(ms) => OffsetDateTime::from_unix_timestamp_nanos(ms as i128 * 1_000_000)
+            .map(Some)
+            .map_err(serde::de::Error::custom),
+        None => Ok(None),
+    }
 }

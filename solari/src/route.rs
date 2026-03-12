@@ -91,6 +91,55 @@ impl<'a, T: Timetable<'a>> Router<'a, T> {
         max_steps: Option<usize>,
         max_step_delta: Option<usize>,
     ) -> SolariResponse {
+        self.route_inner(
+            Some(route_start_time),
+            None,
+            start_location,
+            target_location,
+            max_distance_meters,
+            max_candidate_stops_each_side,
+            max_steps,
+            max_step_delta,
+        )
+        .await
+    }
+
+    pub async fn route_arrive_by(
+        &'a self,
+        end_at: Time,
+        start_location: LatLng,
+        target_location: LatLng,
+        max_distance_meters: Option<f64>,
+        max_candidate_stops_each_side: Option<usize>,
+        max_steps: Option<usize>,
+        max_step_delta: Option<usize>,
+    ) -> SolariResponse {
+        self.route_inner(
+            None,
+            Some(end_at),
+            start_location,
+            target_location,
+            max_distance_meters,
+            max_candidate_stops_each_side,
+            max_steps,
+            max_step_delta,
+        )
+        .await
+    }
+
+    async fn route_inner(
+        &'a self,
+        start_at: Option<Time>,
+        end_at: Option<Time>,
+        start_location: LatLng,
+        target_location: LatLng,
+        max_distance_meters: Option<f64>,
+        max_candidate_stops_each_side: Option<usize>,
+        max_steps: Option<usize>,
+        max_step_delta: Option<usize>,
+    ) -> SolariResponse {
+        let is_backward = end_at.is_some();
+
         let start_stops = self.nearest_stops(
             start_location,
             max_candidate_stops_each_side,
@@ -111,6 +160,7 @@ impl<'a, T: Timetable<'a>> Router<'a, T> {
             target_stops = target_stops.len(),
             max_distance_meters = ?max_distance_meters,
             max_candidate_stops = ?max_candidate_stops_each_side,
+            is_backward = is_backward,
             "route: nearest stops found"
         );
         if !start_stops.is_empty() {
@@ -132,75 +182,152 @@ impl<'a, T: Timetable<'a>> Router<'a, T> {
             );
         }
 
-        let target_costs: Vec<(usize, u32)> = target_stops
-            .iter()
-            .map(|stop| {
-                (
-                    stop.id(),
-                    (FAKE_WALK_SPEED_SECONDS_PER_METER
-                        * stop.location().distance(&target_location).rad()
-                        * EARTH_RADIUS_APPROX) as u32,
-                )
-            })
-            .collect();
+        if is_backward {
+            // Reverse RAPTOR: targets are "sources", starts are "targets".
+            // We initialize from target stops and propagate backward to
+            // find the latest departure from start stops.
+            let start_costs: Vec<(usize, u32)> = start_stops
+                .iter()
+                .map(|stop| {
+                    (
+                        stop.id(),
+                        (FAKE_WALK_SPEED_SECONDS_PER_METER
+                            * stop.location().distance(&start_location).rad()
+                            * EARTH_RADIUS_APPROX) as u32,
+                    )
+                })
+                .collect();
 
-        let mut context = RouterContext {
-            best_times_per_round: Vec::new(),
-            marked_stops: Vec::new(),
-            marked_routes: Vec::new(),
-            timetable: &self.timetable,
-            targets: target_costs.clone(),
-            max_steps,
-            max_step_delta,
-            step_log: vec![InternalStep {
-                previous_step: 0usize,
-                from: InternalStepLocation::Location(LatLng::from_degrees(0.0, 0.0)),
-                to: InternalStepLocation::Location(LatLng::from_degrees(0.0, 0.0)),
-                route: None,
-                round: 0,
-                departure: Time::epoch(),
-                arrival: Time::epoch(),
-                trip: None,
-            }],
-        };
-        context
-            .init(route_start_time, start_location, &start_stops)
-            .await;
-        context.route().await;
+            let mut context = RouterContext {
+                best_times_per_round: Vec::new(),
+                marked_stops: Vec::new(),
+                marked_routes: Vec::new(),
+                timetable: &self.timetable,
+                targets: start_costs.clone(),
+                max_steps,
+                max_step_delta,
+                step_log: vec![InternalStep {
+                    previous_step: 0usize,
+                    from: InternalStepLocation::Location(LatLng::from_degrees(0.0, 0.0)),
+                    to: InternalStepLocation::Location(LatLng::from_degrees(0.0, 0.0)),
+                    route: None,
+                    round: 0,
+                    departure: Time::epoch(),
+                    arrival: Time::epoch(),
+                    trip: None,
+                }],
+            };
+            context
+                .init_backward(end_at.unwrap(), target_location, &target_stops)
+                .await;
+            context.route_backward().await;
 
-        let rounds_used = context.best_times_per_round.len();
-        let targets_reached = target_costs
-            .iter()
-            .filter(|(id, _)| {
-                context.best_times_per_round.iter().any(|round| round[*id].is_some())
-            })
-            .count();
-        info!(
-            rounds_used = rounds_used,
-            targets_reached = targets_reached,
-            total_targets = target_costs.len(),
-            total_steps = context.step_log.len(),
-            "route: RAPTOR complete"
-        );
+            let rounds_used = context.best_times_per_round.len();
+            let targets_reached = start_costs
+                .iter()
+                .filter(|(id, _)| {
+                    context.best_times_per_round.iter().any(|round| round[*id].is_some())
+                })
+                .count();
+            info!(
+                rounds_used = rounds_used,
+                targets_reached = targets_reached,
+                total_targets = start_costs.len(),
+                total_steps = context.step_log.len(),
+                "route: backward RAPTOR complete"
+            );
 
-        let best_itineraries = self
-            .pick_best_itineraries(&context, &target_costs)
-            .iter()
-            .map(|itinerary| {
-                self.unwind_itinerary(
-                    &context,
-                    itinerary,
-                    route_start_time,
-                    &target_costs,
-                    start_location,
-                    target_location,
-                )
-            })
-            .collect();
+            let best_itineraries = self
+                .pick_best_itineraries_backward(&context, &start_costs)
+                .iter()
+                .map(|itinerary| {
+                    self.unwind_itinerary_backward(
+                        &context,
+                        itinerary,
+                        end_at.unwrap(),
+                        &start_costs,
+                        start_location,
+                        target_location,
+                    )
+                })
+                .collect();
 
-        SolariResponse {
-            status: ResponseStatus::Ok,
-            itineraries: best_itineraries,
+            SolariResponse {
+                status: ResponseStatus::Ok,
+                itineraries: best_itineraries,
+            }
+        } else {
+            let target_costs: Vec<(usize, u32)> = target_stops
+                .iter()
+                .map(|stop| {
+                    (
+                        stop.id(),
+                        (FAKE_WALK_SPEED_SECONDS_PER_METER
+                            * stop.location().distance(&target_location).rad()
+                            * EARTH_RADIUS_APPROX) as u32,
+                    )
+                })
+                .collect();
+
+            let route_start_time = start_at.unwrap();
+            let mut context = RouterContext {
+                best_times_per_round: Vec::new(),
+                marked_stops: Vec::new(),
+                marked_routes: Vec::new(),
+                timetable: &self.timetable,
+                targets: target_costs.clone(),
+                max_steps,
+                max_step_delta,
+                step_log: vec![InternalStep {
+                    previous_step: 0usize,
+                    from: InternalStepLocation::Location(LatLng::from_degrees(0.0, 0.0)),
+                    to: InternalStepLocation::Location(LatLng::from_degrees(0.0, 0.0)),
+                    route: None,
+                    round: 0,
+                    departure: Time::epoch(),
+                    arrival: Time::epoch(),
+                    trip: None,
+                }],
+            };
+            context
+                .init(route_start_time, start_location, &start_stops)
+                .await;
+            context.route().await;
+
+            let rounds_used = context.best_times_per_round.len();
+            let targets_reached = target_costs
+                .iter()
+                .filter(|(id, _)| {
+                    context.best_times_per_round.iter().any(|round| round[*id].is_some())
+                })
+                .count();
+            info!(
+                rounds_used = rounds_used,
+                targets_reached = targets_reached,
+                total_targets = target_costs.len(),
+                total_steps = context.step_log.len(),
+                "route: RAPTOR complete"
+            );
+
+            let best_itineraries = self
+                .pick_best_itineraries(&context, &target_costs)
+                .iter()
+                .map(|itinerary| {
+                    self.unwind_itinerary(
+                        &context,
+                        itinerary,
+                        route_start_time,
+                        &target_costs,
+                        start_location,
+                        target_location,
+                    )
+                })
+                .collect();
+
+            SolariResponse {
+                status: ResponseStatus::Ok,
+                itineraries: best_itineraries,
+            }
         }
     }
 
@@ -494,6 +621,230 @@ impl<'a, T: Timetable<'a>> Router<'a, T> {
             }
         });
         itineraries
+    }
+
+    /// Pick best itineraries for backward RAPTOR.
+    /// In backward mode, final_time is latest departure (maximize).
+    /// "targets" here are the START stops (where the user departs from).
+    fn pick_best_itineraries_backward(
+        &self,
+        context: &RouterContext<'a, T>,
+        start_costs: &[(usize, u32)],
+    ) -> Vec<InternalItinerary> {
+        let best_round_count = if let Some(round_count) = context.fewest_rounds_to_target() {
+            round_count
+        } else {
+            return Vec::new();
+        };
+
+        let mut itineraries = HashSet::new();
+        let walking_scalars = [0.5, 1.0, 2.0];
+        // In backward mode, "best" = latest departure.
+        let mut best_departure_per_scenario: Vec<Option<Time>> = vec![None; walking_scalars.len()];
+        let max_round = match (context.max_step_delta, context.max_steps) {
+            (None, None) => context.best_times_per_round.len(),
+            (None, Some(transfers)) => context.best_times_per_round.len().min(transfers),
+            (Some(delta), None) => context
+                .best_times_per_round
+                .len()
+                .min(best_round_count + delta),
+            (Some(delta), Some(transfers)) => context
+                .best_times_per_round
+                .len()
+                .min(best_round_count + delta)
+                .min(transfers),
+        };
+        for round in 0..max_round {
+            for (ws_idx, _walking_scalar) in walking_scalars.iter().enumerate() {
+                if let Some((itinerary, _)) = start_costs
+                    .iter()
+                    .filter_map(|(target_id, cost)| {
+                        context.best_times_per_round[round][*target_id]
+                            .as_ref()
+                            .map(|it| (it, *cost))
+                    })
+                    .filter(|(it, _)| context.step_log[it.last_step].route.is_some())
+                    .max_by_key(|(it, cost)| {
+                        // Maximize departure time minus walk cost.
+                        it.final_time.epoch_seconds().saturating_sub(*cost)
+                    })
+                {
+                    if let Some(prev_best) = &mut best_departure_per_scenario[ws_idx] {
+                        if &itinerary.final_time > prev_best {
+                            *prev_best = itinerary.final_time;
+                            itineraries.insert(itinerary.clone());
+                        }
+                    } else {
+                        best_departure_per_scenario[ws_idx] = Some(itinerary.final_time);
+                        itineraries.insert(itinerary.clone());
+                    }
+                }
+            }
+        }
+
+        let mut itineraries: Vec<_> = itineraries.into_iter().collect();
+        // Sort by latest departure first (best), then fewest rounds.
+        itineraries.sort_by(|a, b| {
+            b.final_time
+                .cmp(&a.final_time)
+                .then(context.step_log[a.last_step].round.cmp(&context.step_log[b.last_step].round))
+        });
+        itineraries
+    }
+
+    /// Unwind a backward RAPTOR itinerary into legs.
+    /// The step log is reversed: it goes from target stops toward origin stops.
+    /// We need to reverse the legs so they go origin → target.
+    fn unwind_itinerary_backward(
+        &'a self,
+        context: &RouterContext<'a, T>,
+        itinerary: &InternalItinerary,
+        end_at: Time,
+        start_costs: &[(usize, u32)],
+        start_location: LatLng,
+        target_location: LatLng,
+    ) -> SolariItinerary {
+        // Collect steps from the step log (target → origin order).
+        let mut raw_steps = vec![];
+        let mut step_cursor = itinerary.last_step;
+        while step_cursor != 0 {
+            raw_steps.push(&context.step_log[step_cursor]);
+            step_cursor = context.step_log[step_cursor].previous_step;
+        }
+        // raw_steps is now [closest_to_origin, ..., closest_to_target]
+        // because backward RAPTOR's step log chains from target toward origin.
+        // Actually, the step log chains: each step's previous_step points
+        // toward the target (where we initialized). So raw_steps goes
+        // origin → target. We want that order for legs.
+
+        let transfer_graph = self.transfer_graph.clone();
+        let mut search_context = TransferGraphSearcher::new(transfer_graph);
+
+        // Build legs. In backward RAPTOR, step.from is the alight stop
+        // (closer to target) and step.to is the board stop (closer to origin).
+        // So for a forward-ordered leg: board at step.to, alight at step.from.
+        let mut legs: Vec<SolariLeg> = Vec::new();
+        for step in &raw_steps {
+            if step.route.is_some() {
+                // Transit leg: board at step.to (origin side), alight at step.from (target side).
+                let board_stop = if let InternalStepLocation::Stop(s) = step.to { s } else { continue; };
+                let alight_stop = if let InternalStepLocation::Stop(s) = step.from { s } else { continue; };
+                let board_loc = board_stop.location();
+                let alight_loc = alight_stop.location();
+
+                // Get the actual departure/arrival times from the trip.
+                let trip = step.trip.unwrap();
+                let route = step.route.unwrap();
+                let route_stops = route.route_stops(&self.timetable);
+
+                // Find board and alight stop sequences.
+                let board_seq = route_stops.iter()
+                    .find(|rs| rs.stop(&self.timetable).id() == board_stop.id())
+                    .map(|rs| rs.stop_seq());
+                let alight_seq = route_stops.iter()
+                    .find(|rs| rs.stop(&self.timetable).id() == alight_stop.id())
+                    .map(|rs| rs.stop_seq());
+
+                let dep_time = board_seq
+                    .map(|seq| trip.stop_times(&self.timetable)[seq].departure())
+                    .unwrap_or(step.departure);
+                let arr_time = alight_seq
+                    .map(|seq| trip.stop_times(&self.timetable)[seq].arrival())
+                    .unwrap_or(step.arrival);
+
+                let shape = self.clip_shape(step);
+
+                legs.push(SolariLeg::Transit {
+                    start_time: OffsetDateTime::from_unix_timestamp(dep_time.epoch_seconds() as i64)
+                        .expect("Invalid Unix timestamp"),
+                    end_time: OffsetDateTime::from_unix_timestamp(arr_time.epoch_seconds() as i64)
+                        .expect("Invalid Unix timestamp"),
+                    start_location: crate::api::LatLng {
+                        lat: board_loc.lat.deg(),
+                        lon: board_loc.lng.deg(),
+                        stop: board_stop.metadata(&self.timetable).name.clone(),
+                    },
+                    end_location: crate::api::LatLng {
+                        lat: alight_loc.lat.deg(),
+                        lon: alight_loc.lng.deg(),
+                        stop: alight_stop.metadata(&self.timetable).name.clone(),
+                    },
+                    transit_route: trip.metadata(&self.timetable).route_name.clone(),
+                    transit_agency: trip.metadata(&self.timetable).agency_name.clone(),
+                    route_shape: shape,
+                });
+            } else {
+                // Transfer leg: walk from step.to (origin side) to step.from (target side).
+                let from_stop = if let InternalStepLocation::Stop(s) = step.to { s } else { continue; };
+                let to_stop = if let InternalStepLocation::Stop(s) = step.from { s } else { continue; };
+                let from_loc = from_stop.location();
+                let to_loc = to_stop.location();
+
+                let from_coord = Coord { y: from_loc.lat.deg(), x: from_loc.lng.deg() };
+                let to_coord = Coord { y: to_loc.lat.deg(), x: to_loc.lng.deg() };
+                let transfer_shape = match self.transfer_graph.transfer_path(
+                    &mut search_context,
+                    &from_coord,
+                    &to_coord,
+                ) {
+                    Ok(path) => Some(path.shape),
+                    Err(err) => {
+                        error!("Failed to calculate transfer path: {}", err);
+                        None
+                    }
+                };
+
+                legs.push(SolariLeg::Transfer {
+                    start_time: OffsetDateTime::from_unix_timestamp(
+                        step.departure.epoch_seconds() as i64,
+                    )
+                    .expect("Invalid Unix timestamp"),
+                    end_time: OffsetDateTime::from_unix_timestamp(
+                        step.arrival.epoch_seconds() as i64,
+                    )
+                    .expect("Invalid Unix timestamp"),
+                    start_location: crate::api::LatLng {
+                        lat: from_loc.lat.deg(),
+                        lon: from_loc.lng.deg(),
+                        stop: from_stop.metadata(&self.timetable).name.clone(),
+                    },
+                    end_location: crate::api::LatLng {
+                        lat: to_loc.lat.deg(),
+                        lon: to_loc.lng.deg(),
+                        stop: to_stop.metadata(&self.timetable).name.clone(),
+                    },
+                    route_shape: transfer_shape,
+                });
+            }
+        }
+
+        // Compute overall start/end times.
+        let journey_start = if let Some(first_leg) = legs.first() {
+            match first_leg {
+                SolariLeg::Transit { start_time, .. } => *start_time,
+                SolariLeg::Transfer { start_time, .. } => *start_time,
+            }
+        } else {
+            OffsetDateTime::from_unix_timestamp(end_at.epoch_seconds() as i64)
+                .expect("Invalid Unix timestamp")
+        };
+
+        SolariItinerary {
+            start_location: crate::api::LatLng {
+                lat: start_location.lat.deg(),
+                lon: start_location.lng.deg(),
+                stop: None,
+            },
+            end_location: crate::api::LatLng {
+                lat: target_location.lat.deg(),
+                lon: target_location.lng.deg(),
+                stop: None,
+            },
+            start_time: journey_start,
+            end_time: OffsetDateTime::from_unix_timestamp(end_at.epoch_seconds() as i64)
+                .expect("Invalid Unix timestamp"),
+            legs,
+        }
     }
 
     fn clip_shape(&'a self, step: &InternalStep) -> Option<String> {
@@ -1125,69 +1476,368 @@ where
         }
     }
 
-    /// rRAPTOR: range query. Runs RAPTOR for multiple departure times
-    /// (from latest to earliest), keeping labels between runs for pruning.
-    /// This produces a Pareto set of journeys trading off departure time
-    /// vs arrival time: "leave later but arrive at the same time."
-    pub async fn route_range(
-        &mut self,
-        departure_times: &[Time],
-        start_location: LatLng,
-        starts: &[&'a Stop],
-    ) {
-        // departure_times should be sorted latest-first.
-        // For each departure time, run RAPTOR but keep labels from previous runs.
-        // Per the paper (Section 4.2): we cannot use local pruning (τ*),
-        // but we CAN use the labels from previous (later) departures to prune.
-        // At the beginning of round k, set τk(p) = τk-1(p) where it improves.
-        for departure_time in departure_times {
-            // Re-initialize round 0 for this departure time.
-            // Mark start stops with new departure time costs.
-            let start_costs: HashMap<usize, u32> = starts
-                .iter()
-                .enumerate()
-                .map(|(i, start)| {
-                    (
-                        i,
-                        (FAKE_WALK_SPEED_SECONDS_PER_METER
-                            * start.location().distance(&start_location).rad()
-                            * EARTH_RADIUS_APPROX) as u32,
-                    )
-                })
-                .collect();
+    // ---------------------------------------------------------------
+    // Reverse RAPTOR: given an arrival deadline (end_at), find the
+    // latest departure. The algorithm is the symmetric dual of
+    // forward RAPTOR:
+    //   - Initialize from TARGET stops with end_at minus walk cost.
+    //   - Each round scans routes in REVERSE stop order.
+    //   - Uses latest_trip_arriving_by instead of earliest_trip_from.
+    //   - "Better" = later time (maximize departure), so final_time
+    //     in InternalItinerary represents latest known departure.
+    //   - Transfers subtract walk time instead of adding it.
+    // ---------------------------------------------------------------
 
-            // Reset marks for this iteration.
-            for marks in &mut self.marked_stops {
-                marks.fill(StopMark::Unmarked);
+    async fn init_backward(&mut self, end_at: Time, target_location: LatLng, targets: &[&'a Stop]) {
+        self.best_times_per_round
+            .push(vec![None; self.timetable.stop_count()]);
+        self.marked_stops
+            .push(vec![StopMark::Unmarked; self.timetable.stop_count()]);
+        self.marked_routes.push(RefCell::new(vec![
+            TripStopTime::marked();
+            self.timetable.routes().len()
+        ]));
+
+        for stop in targets {
+            let walk_cost = (FAKE_WALK_SPEED_SECONDS_PER_METER
+                * stop.location().distance(&target_location).rad()
+                * EARTH_RADIUS_APPROX) as u32;
+            // Latest time we can be at this stop and still walk to destination by end_at.
+            let latest_at_stop = end_at.minus_seconds(walk_cost);
+            self.maybe_update_departure_time(
+                0u32,
+                &InternalStepLocation::Location(target_location),
+                latest_at_stop.clone(),
+                &InternalStepLocation::Stop(stop),
+                latest_at_stop,
+                None,
+                None,
+                0,
+            );
+        }
+    }
+
+    /// Reverse analog of maybe_update_arrival_time_and_route.
+    /// "Better" = later departure time (maximize).
+    fn maybe_update_departure_time(
+        &mut self,
+        round: u32,
+        from: &InternalStepLocation<'a>,
+        departure_time: Time,
+        to: &InternalStepLocation<'a>,
+        arrival_time: Time,
+        via: Option<Route>,
+        on_trip: Option<Trip>,
+        previous_step: usize,
+    ) -> bool {
+        let mut marked = false;
+        let mut step_log_idx = None;
+        if let InternalStepLocation::Stop(stop) = to {
+            for best_times in &mut self.best_times_per_round.iter_mut().skip(round as usize) {
+                let is_best = if let Some(previous_best) = &best_times[stop.id()] {
+                    // Later departure is better in reverse mode.
+                    let later = &departure_time > &previous_best.final_time;
+                    let equal_and_fewer_rounds = {
+                        &departure_time == &previous_best.final_time
+                            && round <= self.step_log[previous_best.last_step].round
+                    };
+                    later || equal_and_fewer_rounds
+                } else {
+                    true
+                };
+                if is_best {
+                    let step = InternalStep {
+                        round,
+                        from: from.clone(),
+                        to: to.clone(),
+                        route: via,
+                        trip: on_trip,
+                        departure: departure_time.clone(),
+                        arrival: arrival_time.clone(),
+                        previous_step,
+                    };
+
+                    if step_log_idx.is_none() {
+                        step_log_idx = Some(self.step_log.len());
+                        self.step_log.push(step);
+                    }
+
+                    best_times[stop.id()] = Some(InternalItinerary {
+                        final_time: departure_time.clone(),
+                        last_step: step_log_idx.expect("Logic error"),
+                    });
+
+                    marked = true;
+                }
+            }
+            if marked {
+                self.marked_stops[round as usize][stop.id()] = StopMark::Marked;
+            }
+        }
+        marked
+    }
+
+    async fn do_round_backward(&mut self, round: u32) -> bool {
+        let mut marked_stops_total = 0usize;
+
+        {
+            while round as usize + 1 >= self.best_times_per_round.len() {
+                self.best_times_per_round.push(
+                    self.best_times_per_round
+                        .last()
+                        .cloned()
+                        .expect("Logic error, best_times_per_round is empty."),
+                );
+                self.marked_stops
+                    .push(vec![StopMark::Unmarked; self.timetable.stop_count()]);
+                self.marked_routes.push(RefCell::new(vec![
+                    TripStopTime::marked();
+                    self.timetable.routes().len()
+                ]));
             }
 
-            // Update round 0 with new departure time.
-            for (stop_option_index, stop) in starts.iter().enumerate() {
-                if let Some(cost) = start_costs.get(&stop_option_index) {
-                    let arrival = departure_time.clone().plus_seconds(*cost);
-                    // Only update if this is better than what we already have
-                    // from a later departure time.
-                    let dominated = self.best_times_per_round[0][stop.id()]
-                        .as_ref()
-                        .map(|existing| arrival >= existing.final_time)
-                        .unwrap_or(false);
-                    if !dominated {
-                        self.maybe_update_arrival_time_and_route(
-                            0u32,
-                            &InternalStepLocation::Location(start_location),
-                            departure_time.clone(),
-                            &InternalStepLocation::Stop(stop),
-                            arrival,
-                            None,
-                            None,
-                            0,
-                        );
+            // Mark routes based on stops marked in previous round.
+            {
+                let mut new_marked_routes = self.marked_routes[round as usize].borrow_mut();
+                for val in &mut (*new_marked_routes) {
+                    *val = TripStopTime::marked();
+                }
+                for (stop_id, stop_marked) in
+                    self.marked_stops[round as usize - 1].iter_mut().enumerate()
+                {
+                    if *stop_marked != StopMark::Marked {
+                        continue;
                     }
+                    *stop_marked = StopMark::MarkedForTransfersOnly;
+                    // For backward: find latest trips arriving at this stop
+                    // no later than the best known time.
+                    Self::explore_routes_for_marked_stop_backward(
+                        self.timetable,
+                        &mut *new_marked_routes,
+                        self.timetable.stop(stop_id),
+                        &self.best_times_per_round[round as usize - 1][stop_id]
+                            .as_ref()
+                            .unwrap()
+                            .final_time,
+                    );
                 }
             }
 
-            // Run RAPTOR rounds for this departure time.
-            self.route().await;
+            let mut marked_stops_count = 0usize;
+            {
+                let mut marked_routes: Vec<(usize, TripStopTime)> = self.marked_routes
+                    [round as usize]
+                    .borrow()
+                    .iter()
+                    .cloned()
+                    .enumerate()
+                    .collect();
+                marked_routes.sort_by_key(|(_, trip_stop_time)| trip_stop_time.route_stop_seq);
+                let marked_routes = marked_routes;
+
+                for (route_id, arrival_mark) in marked_routes {
+                    if arrival_mark.trip_index == usize::MAX {
+                        continue;
+                    }
+                    let route = self.timetable.route(route_id);
+                    let route_stops = route.route_stops(self.timetable);
+                    let arrival_route_stop = arrival_mark.route_stop(self.timetable);
+                    let mut current_trip: Option<(Trip, RouteStop)> = None;
+                    let mut found_marked_stop = false;
+
+                    // Scan route stops in REVERSE order.
+                    // In forward RAPTOR we scan forward to find where we can
+                    // ride TO. In reverse we scan backward to find where we
+                    // can ride FROM (i.e. board earlier along the route).
+                    for route_stop in route_stops.iter().rev() {
+                        if route_stop.id() == arrival_route_stop.id() {
+                            found_marked_stop = true;
+                        }
+                        if !found_marked_stop {
+                            continue;
+                        }
+
+                        if let Some((trip, boarded_at)) = &mut current_trip {
+                            // We're on `trip`, which we know arrives at `boarded_at`
+                            // by the deadline. Check the departure time at this
+                            // earlier stop along the route.
+                            let dep_at_this_stop =
+                                trip.stop_times(self.timetable)[route_stop.stop_seq()]
+                                    .departure();
+
+                            let previous_step = if let Some(ps) = self.best_times_per_round
+                                [round as usize - 1][boarded_at.stop(self.timetable).id()]
+                            .as_ref()
+                            .map(|s| s.last_step)
+                            {
+                                ps
+                            } else {
+                                continue;
+                            };
+
+                            // Record: depart from route_stop on this trip,
+                            // arrive at boarded_at. In reverse RAPTOR the
+                            // "from" in the step log is where we alight (the
+                            // stop closer to the target) and "to" is where we
+                            // board (the stop closer to the origin).
+                            if self.maybe_update_departure_time(
+                                round,
+                                &InternalStepLocation::Stop(
+                                    boarded_at.stop(self.timetable),
+                                ),
+                                dep_at_this_stop.clone(),
+                                &InternalStepLocation::Stop(route_stop.stop(self.timetable)),
+                                dep_at_this_stop,
+                                Some(trip.route(self.timetable)),
+                                Some(trip.clone()),
+                                previous_step,
+                            ) {
+                                marked_stops_count += 1;
+                            }
+
+                            // Can we catch a later trip at this stop?
+                            // (Symmetric to forward's "can we catch an earlier trip?")
+                            if let Some(later_trip) =
+                                self.latest_trip_arriving_by(route_stop, &self.best_times_per_round
+                                    [round as usize - 1][route_stop.stop(self.timetable).id()]
+                                    .as_ref()
+                                    .map(|s| s.final_time)
+                                    .unwrap_or(dep_at_this_stop.clone()))
+                            {
+                                let later_dep = later_trip.stop_times(self.timetable)
+                                    [route_stop.stop_seq()]
+                                    .departure();
+                                if later_dep > dep_at_this_stop {
+                                    *trip = later_trip;
+                                    *boarded_at = route_stop.clone();
+                                }
+                            }
+                        }
+
+                        if current_trip.is_none() {
+                            // Find latest trip arriving at this stop by the deadline.
+                            if let Some(best) = &self.best_times_per_round[round as usize - 1]
+                                [route_stop.stop(self.timetable).id()]
+                            {
+                                current_trip = self
+                                    .latest_trip_arriving_by(route_stop, &best.final_time)
+                                    .map(|trip| (trip, route_stop.clone()));
+                            }
+                        }
+                    }
+                }
+            }
+            debug!("Backward: Marked {} new stops", marked_stops_count);
+            marked_stops_total += marked_stops_count;
+
+            if marked_stops_count == 0 {
+                return false;
+            }
+        }
+
+        // Backward transfers: from each marked stop, walk backward in time.
+        let mut marked_transfers_count = 0usize;
+        let marked_stops = self.marked_stops[round as usize].clone();
+        for (stop_id, stop_marked) in marked_stops.iter().enumerate() {
+            if *stop_marked == StopMark::Unmarked {
+                continue;
+            }
+            let stop = self.timetable.stop(stop_id);
+
+            for transfer in self.timetable.transfers_from(stop_id) {
+                let transfer_to = transfer.to(self.timetable);
+                let last_step = if let Some(ls) = self.best_times_per_round[round as usize]
+                    [stop.id()]
+                .as_ref()
+                .map(|t| t.last_step)
+                {
+                    ls
+                } else {
+                    continue;
+                };
+                // Don't transfer twice in a row.
+                if self.step_log[last_step].route.is_none() {
+                    continue;
+                }
+                let best_dep_at_stop = self.best_times_per_round[round as usize][stop.id()]
+                    .as_ref()
+                    .unwrap()
+                    .final_time;
+                // Going backward: must arrive at transfer origin earlier.
+                let dep_at_transfer_dest = best_dep_at_stop.minus_seconds(transfer.time_seconds());
+                if self.maybe_update_departure_time(
+                    round + 1,
+                    &InternalStepLocation::Stop(stop),
+                    dep_at_transfer_dest.clone(),
+                    &InternalStepLocation::Stop(transfer_to),
+                    dep_at_transfer_dest,
+                    None,
+                    None,
+                    last_step,
+                ) {
+                    marked_transfers_count += 1;
+                }
+            }
+        }
+        debug!(
+            "Backward: Marked {} transfers.",
+            marked_transfers_count
+        );
+
+        marked_stops_total > 0 || marked_transfers_count > 0
+    }
+
+    /// For backward search: find routes serving a marked stop where a trip
+    /// arrives no later than `not_after`. Symmetric to explore_routes_for_marked_stop.
+    fn explore_routes_for_marked_stop_backward(
+        timetable: &'a T,
+        marked_routes: &mut [TripStopTime],
+        marked_stop: &Stop,
+        not_after: &Time,
+    ) {
+        for stop_route in marked_stop.stop_routes(timetable) {
+            let route = stop_route.route(timetable);
+            // Iterate trips from latest to earliest to find the latest
+            // trip arriving at this stop <= not_after.
+            for trip in route.route_trips(timetable).iter().rev() {
+                let tst = &trip.stop_times(timetable)[stop_route.stop_seq()];
+                if &tst.arrival() > not_after {
+                    continue;
+                }
+                // This is the latest trip arriving <= not_after.
+                // In backward mode, we want the LATEST marked stop along
+                // the route (closest to end), symmetric to forward wanting
+                // the earliest marked stop.
+                if marked_routes[route.id()].trip_index == usize::MAX
+                    || tst.arrival() > marked_routes[route.id()].arrival()
+                    || (tst.arrival() == marked_routes[route.id()].arrival()
+                        && tst.route_stop_seq < marked_routes[route.id()].route_stop_seq)
+                {
+                    marked_routes[route.id()] = *tst;
+                }
+                break;
+            }
+        }
+    }
+
+    pub async fn route_backward(&mut self) {
+        let mut round = 1;
+        let mut marked_stops = true;
+        while marked_stops {
+            if let Some(max_steps) = self.max_steps {
+                if round > max_steps {
+                    break;
+                }
+            }
+            if let (Some(max_step_delta), Some(best_rounds_to_target)) =
+                (self.max_step_delta, self.fewest_rounds_to_target())
+            {
+                if round >= best_rounds_to_target + max_step_delta {
+                    break;
+                }
+            }
+            marked_stops = self.do_round_backward(round as u32).await;
+            round += 1;
         }
     }
 }

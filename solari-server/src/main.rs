@@ -8,6 +8,7 @@ use solari::{
     route::Router,
     timetable::{Time, mmap::MmapTimetable},
 };
+use time::OffsetDateTime;
 use tracing_subscriber::FmtSubscriber;
 
 #[macro_use]
@@ -23,10 +24,10 @@ async fn plan(
 
     let max_transfers = usize::min(5, request.0.max_transfers.0);
 
-    return Json(
+    let response = if let Some(end_at) = request.0.end_at {
         router
-            .route(
-                Time::from_epoch_seconds(request.0.start_at.unix_timestamp() as u32),
+            .route_arrive_by(
+                Time::from_epoch_seconds(end_at.unix_timestamp() as u32),
                 from,
                 to,
                 Some(1500f64),
@@ -34,8 +35,24 @@ async fn plan(
                 Some(max_transfers),
                 Some(2),
             )
-            .await,
-    );
+            .await
+    } else {
+        let start_at = request.0.start_at
+            .unwrap_or_else(|| OffsetDateTime::now_utc());
+        router
+            .route(
+                Time::from_epoch_seconds(start_at.unix_timestamp() as u32),
+                from,
+                to,
+                Some(1500f64),
+                Some(1000),
+                Some(max_transfers),
+                Some(2),
+            )
+            .await
+    };
+
+    Json(response)
 }
 
 #[derive(Parser)]
