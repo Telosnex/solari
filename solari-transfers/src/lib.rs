@@ -187,9 +187,11 @@ impl<G: FastGraph, I: SphereIndex<usize>> TransferGraph<G, I> {
             to_unique = to_unique.len(),
             "transfer_path inputs"
         );
+        // 2_000_000 mm = 2000m, generous limit for walking transfers
+        let max_weight_mm = 2_000_000;
         if let Some(path) = search_context
             .ensure_path_calculator()
-            .calc_path_multiple_sources_and_targets(&self.graph, from, to)
+            .calc_path_multiple_sources_and_targets_with_max(&self.graph, from, to, max_weight_mm)
         {
             let t2 = std::time::Instant::now();
             let database = self

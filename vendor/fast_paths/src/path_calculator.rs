@@ -280,7 +280,17 @@ impl PathCalculator {
         starts: Vec<(NodeId, Weight)>,
         ends: Vec<(NodeId, Weight)>,
     ) -> Option<ShortestPath> {
-        self.calc_weight_and_optional_path(graph, starts, ends, true)
+        self.calc_path_multiple_sources_and_targets_with_max(graph, starts, ends, WEIGHT_MAX)
+    }
+
+    pub fn calc_path_multiple_sources_and_targets_with_max<G: FastGraph>(
+        &mut self,
+        graph: &G,
+        starts: Vec<(NodeId, Weight)>,
+        ends: Vec<(NodeId, Weight)>,
+        max_weight: Weight,
+    ) -> Option<ShortestPath> {
+        self.calc_weight_and_optional_path(graph, starts, ends, true, max_weight)
             .map(|(best_weight, nodes)| {
                 let nodes = nodes.expect("path nodes should be present when include_path=true");
                 ShortestPath::new(nodes[0], nodes[nodes.len() - 1], best_weight, nodes)
@@ -293,7 +303,7 @@ impl PathCalculator {
         starts: Vec<(NodeId, Weight)>,
         ends: Vec<(NodeId, Weight)>,
     ) -> Option<Weight> {
-        self.calc_weight_and_optional_path(graph, starts, ends, false)
+        self.calc_weight_and_optional_path(graph, starts, ends, false, WEIGHT_MAX)
             .map(|(best_weight, _)| best_weight)
     }
 
@@ -303,6 +313,7 @@ impl PathCalculator {
         starts: Vec<(NodeId, Weight)>,
         ends: Vec<(NodeId, Weight)>,
         include_path: bool,
+        max_weight: Weight,
     ) -> Option<(Weight, Option<Vec<NodeId>>)> {
         assert_eq!(
             graph.get_num_nodes(),
@@ -367,7 +378,7 @@ impl PathCalculator {
                 if self.is_settled_fwd(curr.node_id) {
                     continue;
                 }
-                if curr.weight > best_weight {
+                if curr.weight > best_weight || curr.weight > max_weight {
                     break;
                 }
                 // stall on demand optimization
@@ -403,7 +414,7 @@ impl PathCalculator {
                 if self.is_settled_bwd(curr.node_id) {
                     continue;
                 }
-                if curr.weight > best_weight {
+                if curr.weight > best_weight || curr.weight > max_weight {
                     break;
                 }
                 // stall on demand optimization
