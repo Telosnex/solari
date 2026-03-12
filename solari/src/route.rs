@@ -752,7 +752,7 @@ impl<'a, T: Timetable<'a>> Router<'a, T> {
                     .map(|seq| trip.stop_times(&self.timetable)[seq].arrival())
                     .unwrap_or(step.arrival);
 
-                let shape = self.clip_shape(step);
+                let shape = self.clip_shape_backward(step);
 
                 legs.push(SolariLeg::Transit {
                     start_time: OffsetDateTime::from_unix_timestamp(dep_time.epoch_seconds() as i64)
@@ -924,6 +924,17 @@ impl<'a, T: Timetable<'a>> Router<'a, T> {
             }
         };
         None
+    }
+
+    /// clip_shape but with from/to swapped for backward RAPTOR steps,
+    /// where step.from is the alight stop and step.to is the board stop.
+    fn clip_shape_backward(&'a self, step: &InternalStep) -> Option<String> {
+        let flipped = InternalStep {
+            from: step.to.clone(),
+            to: step.from.clone(),
+            ..*step
+        };
+        self.clip_shape(&flipped)
     }
 
     fn closest_point(target: &Point, points: &Vec<Coord>) -> Option<(usize, Point)> {
