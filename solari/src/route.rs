@@ -832,6 +832,26 @@ where
         }
     }
 
+    /// Find the latest trip that arrives at `route_stop` no later than `not_after`.
+    fn latest_trip_arriving_by(&self, route_stop: &RouteStop, not_after: &Time) -> Option<Trip> {
+        let trips = route_stop.route(self.timetable).route_trips(self.timetable);
+        // Binary search for the last trip arriving <= not_after
+        let position = match trips.binary_search_by_key(not_after, |trip| {
+            trip.stop_times(self.timetable)[route_stop.stop_seq()].arrival()
+        }) {
+            Ok(position) => position,
+            // Err(position) means not_after would be inserted at position,
+            // so the last trip arriving <= not_after is at position - 1
+            Err(position) => {
+                if position == 0 {
+                    return None;
+                }
+                position - 1
+            }
+        };
+        Some(trips[position])
+    }
+
     async fn do_round(&mut self, round: u32) -> bool {
         let mut marked_stops_total = 0usize;
 
@@ -1102,6 +1122,72 @@ where
             }
             marked_stops = self.do_round(round as u32).await;
             round += 1;
+        }
+    }
+
+    /// rRAPTOR: range query. Runs RAPTOR for multiple departure times
+    /// (from latest to earliest), keeping labels between runs for pruning.
+    /// This produces a Pareto set of journeys trading off departure time
+    /// vs arrival time: "leave later but arrive at the same time."
+    pub async fn route_range(
+        &mut self,
+        departure_times: &[Time],
+        start_location: LatLng,
+        starts: &[&'a Stop],
+    ) {
+        // departure_times should be sorted latest-first.
+        // For each departure time, run RAPTOR but keep labels from previous runs.
+        // Per the paper (Section 4.2): we cannot use local pruning (τ*),
+        // but we CAN use the labels from previous (later) departures to prune.
+        // At the beginning of round k, set τk(p) = τk-1(p) where it improves.
+        for departure_time in departure_times {
+            // Re-initialize round 0 for this departure time.
+            // Mark start stops with new departure time costs.
+            let start_costs: HashMap<usize, u32> = starts
+                .iter()
+                .enumerate()
+                .map(|(i, start)| {
+                    (
+                        i,
+                        (FAKE_WALK_SPEED_SECONDS_PER_METER
+                            * start.location().distance(&start_location).rad()
+                            * EARTH_RADIUS_APPROX) as u32,
+                    )
+                })
+                .collect();
+
+            // Reset marks for this iteration.
+            for marks in &mut self.marked_stops {
+                marks.fill(StopMark::Unmarked);
+            }
+
+            // Update round 0 with new departure time.
+            for (stop_option_index, stop) in starts.iter().enumerate() {
+                if let Some(cost) = start_costs.get(&stop_option_index) {
+                    let arrival = departure_time.clone().plus_seconds(*cost);
+                    // Only update if this is better than what we already have
+                    // from a later departure time.
+                    let dominated = self.best_times_per_round[0][stop.id()]
+                        .as_ref()
+                        .map(|existing| arrival >= existing.final_time)
+                        .unwrap_or(false);
+                    if !dominated {
+                        self.maybe_update_arrival_time_and_route(
+                            0u32,
+                            &InternalStepLocation::Location(start_location),
+                            departure_time.clone(),
+                            &InternalStepLocation::Stop(stop),
+                            arrival,
+                            None,
+                            None,
+                            0,
+                        );
+                    }
+                }
+            }
+
+            // Run RAPTOR rounds for this departure time.
+            self.route().await;
         }
     }
 }

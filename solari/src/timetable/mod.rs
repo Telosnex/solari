@@ -324,6 +324,15 @@ impl Time {
         }
     }
 
+    pub fn minus_seconds(&self, seconds: u32) -> Time {
+        Time {
+            epoch_seconds: self
+                .epoch_seconds
+                .checked_sub(seconds)
+                .unwrap_or(0),
+        }
+    }
+
     pub fn epoch_seconds(&self) -> u32 {
         return self.epoch_seconds;
     }
