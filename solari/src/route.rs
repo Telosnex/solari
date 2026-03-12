@@ -1405,7 +1405,7 @@ where
                 let arrival_at_transfer_end =
                     best_arrival_at_transfer_start.plus_seconds(transfer.time_seconds());
                 total_transfers_count += 1;
-                if self.maybe_update_arrival_time_and_route(
+                let did_update = self.maybe_update_arrival_time_and_route(
                     round + 1,
                     &InternalStepLocation::Stop(stop),
                     best_arrival_at_transfer_start,
@@ -1414,8 +1414,25 @@ where
                     None,
                     None,
                     last_step,
-                ) {
+                );
+                if did_update {
                     marked_transfers_count += 1;
+                }
+                // Debug: log transfers to/from Amtrak stops
+                let to_name = transfer_to.metadata(self.timetable).name.clone().unwrap_or_default();
+                let from_name = stop.metadata(self.timetable).name.clone().unwrap_or_default();
+                if to_name == "Los Angeles" || to_name == "Anaheim" || from_name == "Los Angeles" || from_name == "Anaheim" {
+                    info!(
+                        round = round,
+                        from_name = %from_name,
+                        from_id = stop.id(),
+                        to_name = %to_name,
+                        to_id = transfer_to.id(),
+                        transfer_time = transfer.time_seconds(),
+                        arrival = arrival_at_transfer_end.epoch_seconds(),
+                        did_update = did_update,
+                        "AMTRAK_DEBUG: transfer"
+                    );
                 }
             }
         }
