@@ -818,11 +818,21 @@ impl<'a, T: Timetable<'a>> Router<'a, T> {
             }
         }
 
-        // Compute overall start/end times.
+        // Compute overall start/end times from actual legs.
         let journey_start = if let Some(first_leg) = legs.first() {
             match first_leg {
                 SolariLeg::Transit { start_time, .. } => *start_time,
                 SolariLeg::Transfer { start_time, .. } => *start_time,
+            }
+        } else {
+            OffsetDateTime::from_unix_timestamp(end_at.epoch_seconds() as i64)
+                .expect("Invalid Unix timestamp")
+        };
+
+        let journey_end = if let Some(last_leg) = legs.last() {
+            match last_leg {
+                SolariLeg::Transit { end_time, .. } => *end_time,
+                SolariLeg::Transfer { end_time, .. } => *end_time,
             }
         } else {
             OffsetDateTime::from_unix_timestamp(end_at.epoch_seconds() as i64)
@@ -841,8 +851,7 @@ impl<'a, T: Timetable<'a>> Router<'a, T> {
                 stop: None,
             },
             start_time: journey_start,
-            end_time: OffsetDateTime::from_unix_timestamp(end_at.epoch_seconds() as i64)
-                .expect("Invalid Unix timestamp"),
+            end_time: journey_end,
             legs,
         }
     }
