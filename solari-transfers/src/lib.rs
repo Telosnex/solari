@@ -169,9 +169,20 @@ impl<G: FastGraph, I: SphereIndex<usize>> TransferGraph<G, I> {
         to: &Coord,
     ) -> Result<TransferPath, anyhow::Error> {
         let t0 = std::time::Instant::now();
+        let from_coord = from.clone();
+        let to_coord = to.clone();
         let from = self.get_nearest_nodes(from);
         let to = self.get_nearest_nodes(to);
         let t1 = std::time::Instant::now();
+        tracing::info!(
+            from_lat = from_coord.y,
+            from_lon = from_coord.x,
+            to_lat = to_coord.y,
+            to_lon = to_coord.x,
+            from_nodes = from.len(),
+            to_nodes = to.len(),
+            "transfer_path inputs"
+        );
         if let Some(path) = search_context
             .ensure_path_calculator()
             .calc_path_multiple_sources_and_targets(&self.graph, from, to)
