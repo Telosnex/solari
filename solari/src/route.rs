@@ -42,7 +42,7 @@ impl<'a, T: Timetable<'a>> Router<'a, T> {
         let transfer_graph = Arc::new(
             TransferGraph::<FastGraphStatic, SphereIndexMmap<usize>>::read_from_dir(
                 transfer_graph_path.clone(),
-                database,
+                Some(database),
             )?,
         );
         info!("Built router");
