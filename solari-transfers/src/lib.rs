@@ -168,15 +168,12 @@ impl<G: FastGraph, I: SphereIndex<usize>> TransferGraph<G, I> {
         from: &Coord,
         to: &Coord,
     ) -> Result<TransferPath, anyhow::Error> {
-        let t0 = std::time::Instant::now();
         let from = self.get_nearest_nodes(from);
         let to = self.get_nearest_nodes(to);
-        let t1 = std::time::Instant::now();
         if let Some(path) = search_context
             .ensure_path_calculator()
             .calc_path_multiple_sources_and_targets(&self.graph, from, to)
         {
-            let t2 = std::time::Instant::now();
             let database = self
                 .database
                 .as_ref()
@@ -184,7 +181,6 @@ impl<G: FastGraph, I: SphereIndex<usize>> TransferGraph<G, I> {
             let txn = database.begin_read()?;
             let shapes = txn.open_table(EDGE_SHAPE_TABLE)?;
             let mut path_shape: Vec<Coord<f64>> = Vec::new();
-            let num_edges = path.get_nodes().len().saturating_sub(1);
             for pair in path.get_nodes().windows(2) {
                 let from = pair[0] as u64;
                 let to = pair[1] as u64;
@@ -197,14 +193,6 @@ impl<G: FastGraph, I: SphereIndex<usize>> TransferGraph<G, I> {
                 let shape_linestring = polyline::decode_polyline(&shape_string, 5)?;
                 path_shape.extend(shape_linestring.0);
             }
-            let t3 = std::time::Instant::now();
-            tracing::info!(
-                nearest_ms = t1.duration_since(t0).as_millis() as u64,
-                route_ms = t2.duration_since(t1).as_millis() as u64,
-                shapes_ms = t3.duration_since(t2).as_millis() as u64,
-                num_edges = num_edges,
-                "transfer_path timing"
-            );
             return Ok(TransferPath {
                 length_mm: path.get_weight() as u64,
                 shape: polyline::encode_coordinates(path_shape, 5)?,
