@@ -1132,9 +1132,6 @@ where
                     };
 
                     if step_log_idx.is_none() {
-                        if round > 0 && self.step_log[previous_step].round >= round {
-                            error!("Rounds are not advancing in maybe_update_arrival_time_and_route: {}, {}, {}", round, self.step_log[previous_step].round, latest_step.route.is_some());
-                        }
                         step_log_idx = Some(self.step_log.len());
                         self.step_log.push(latest_step);
                     }
@@ -1491,7 +1488,7 @@ where
                     best_arrival_at_transfer_start.plus_seconds(transfer.time_seconds());
                 total_transfers_count += 1;
                 let did_update = self.maybe_update_arrival_time_and_route(
-                    round + 1,
+                    round,
                     &InternalStepLocation::Stop(stop),
                     best_arrival_at_transfer_start,
                     &InternalStepLocation::Stop(transfer_to),
@@ -1502,22 +1499,6 @@ where
                 );
                 if did_update {
                     marked_transfers_count += 1;
-                }
-                // Debug: log transfers to/from Amtrak stops
-                let to_name = transfer_to.metadata(self.timetable).name.clone().unwrap_or_default();
-                let from_name = stop.metadata(self.timetable).name.clone().unwrap_or_default();
-                if to_name == "Los Angeles" || to_name == "Anaheim" || from_name == "Los Angeles" || from_name == "Anaheim" {
-                    info!(
-                        round = round,
-                        from_name = %from_name,
-                        from_id = stop.id(),
-                        to_name = %to_name,
-                        to_id = transfer_to.id(),
-                        transfer_time = transfer.time_seconds(),
-                        arrival = arrival_at_transfer_end.epoch_seconds(),
-                        did_update = did_update,
-                        "AMTRAK_DEBUG: transfer"
-                    );
                 }
             }
         }
@@ -1892,7 +1873,7 @@ where
                 // Going backward: must arrive at transfer origin earlier.
                 let dep_at_transfer_dest = best_dep_at_stop.minus_seconds(transfer.time_seconds());
                 if self.maybe_update_departure_time(
-                    round + 1,
+                    round,
                     &InternalStepLocation::Stop(stop),
                     dep_at_transfer_dest.clone(),
                     &InternalStepLocation::Stop(transfer_to),
