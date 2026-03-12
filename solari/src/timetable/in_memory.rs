@@ -549,7 +549,7 @@ impl<'a> InMemoryTimetableBuilder {
             headsign: gtfs_trip.trip_headsign.clone(),
             route_name: {
                 let route = &gtfs.routes[&route_data.gtfs_route_id];
-                route.short_name.clone().or_else(|| route.long_name.clone())
+                route.short_name.clone().filter(|s| !s.is_empty()).or_else(|| route.long_name.clone())
             },
         };
         self.timetable.trip_metadata_map.insert(trip, metadata);
