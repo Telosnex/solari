@@ -62,6 +62,6 @@ fn rocket() -> _ {
 
     rocket::build()
         .manage(router)
-        .configure(rocket::Config::figment().merge(("port", args.port.unwrap_or(8000))))
+        .configure(rocket::Config::figment().merge(("port", args.port.unwrap_or(8000))).merge(("address", "0.0.0.0")))
         .mount("/", routes![plan])
 }
