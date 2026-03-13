@@ -536,6 +536,16 @@ impl<'a> MmapTimetable<'a> {
             unsafe { MmapOptions::new().huge(page_bits).map(&transfer_index)? };
         let backing_transfers = unsafe { MmapOptions::new().huge(page_bits).map(&transfers)? };
 
+        // Disable readahead on large files — RAPTOR accesses them randomly.
+        // Without this, each page fault triggers ~32 pages of wasted sequential I/O.
+        #[cfg(unix)]
+        {
+            use memmap2::Advice;
+            let _ = backing_trip_stop_times.advise(Advice::Random);
+            let _ = backing_route_trips.advise(Advice::Random);
+            let _ = backing_transfers.advise(Advice::Random);
+        }
+
         MmapTimetable::assemble(
             base_path.clone(),
             Pin::new(backing_routes),

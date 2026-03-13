@@ -112,6 +112,22 @@ fn process_gtfs<'a>(
     Ok(timetable)
 }
 
+/// Compute the geographic centroid of a timetable's stops as (lat_microdeg, lng_microdeg).
+/// Returns (0, 0) for empty timetables.
+fn shard_centroid(tt: &MmapTimetable) -> (i64, i64) {
+    use crate::timetable::Timetable;
+    let stops = tt.stops();
+    if stops.is_empty() {
+        return (0, 0);
+    }
+    let (sum_lat, sum_lng) = stops.iter().fold((0.0f64, 0.0f64), |(lat, lng), stop| {
+        let loc = stop.location();
+        (lat + loc.lat.deg(), lng + loc.lng.deg())
+    });
+    let n = stops.len() as f64;
+    ((sum_lat / n * 1_000_000.0) as i64, (sum_lng / n * 1_000_000.0) as i64)
+}
+
 pub async fn concat_timetables<'a>(
     paths: &[PathBuf],
     base_path: &PathBuf,
@@ -119,10 +135,16 @@ pub async fn concat_timetables<'a>(
 ) -> Result<MmapTimetable<'a>, anyhow::Error> {
     let paths = paths.to_vec();
 
-    let timetables: Vec<MmapTimetable<'_>> = paths
+    let mut timetables: Vec<MmapTimetable<'_>> = paths
         .par_iter()
         .filter_map(|path| MmapTimetable::open(path).ok())
         .collect();
+
+    // Sort shards by geographic centroid so that nearby agencies are
+    // contiguous in the concatenated files. This dramatically improves
+    // I/O locality for mmap-backed queries on memory-constrained boxes.
+    info!("Sorting {} shards by geographic centroid", timetables.len());
+    timetables.sort_by_cached_key(|tt| shard_centroid(tt));
 
     // Combine all timetables into one.
     let timetable = MmapTimetable::concatenate(&timetables, base_path, valhalla_tile_path).await;

@@ -29,22 +29,27 @@ use crate::timetable::{Route, RouteStop, Stop, Time, Timetable, Trip};
 
 pub struct Router<'a, T: Timetable<'a>> {
     timetable: T,
-    transfer_graph: Arc<TransferGraph<FastGraphStatic<'a>, SphereIndexMmap<'a, usize>>>,
+    transfer_graph: Option<Arc<TransferGraph<FastGraphStatic<'a>, SphereIndexMmap<'a, usize>>>>,
 }
 
 impl<'a, T: Timetable<'a>> Router<'a, T> {
-    pub fn new(timetable: T, transfer_graph_path: PathBuf) -> Result<Router<'a, T>, anyhow::Error> {
-        info!("Opening transfer graph metadata db.");
-        let database = Arc::new(redb::Database::open(
-            transfer_graph_path.join("graph_metadata.db"),
-        )?);
-        info!("Opening transfer graph.");
-        let transfer_graph = Arc::new(
-            TransferGraph::<FastGraphStatic, SphereIndexMmap<usize>>::read_from_dir(
-                transfer_graph_path.clone(),
-                Some(database),
-            )?,
-        );
+    pub fn new(timetable: T, transfer_graph_path: Option<PathBuf>) -> Result<Router<'a, T>, anyhow::Error> {
+        let transfer_graph = if let Some(path) = transfer_graph_path {
+            info!("Opening transfer graph metadata db.");
+            let database = Arc::new(redb::Database::open(
+                path.join("graph_metadata.db"),
+            )?);
+            info!("Opening transfer graph.");
+            Some(Arc::new(
+                TransferGraph::<FastGraphStatic, SphereIndexMmap<usize>>::read_from_dir(
+                    path,
+                    Some(database),
+                )?,
+            ))
+        } else {
+            info!("Transfer graph disabled — walk leg shapes will be omitted.");
+            None
+        };
         info!("Built router");
         Ok(Router {
             timetable,
@@ -142,8 +147,10 @@ impl<'a, T: Timetable<'a>> Router<'a, T> {
         max_steps: Option<usize>,
         max_step_delta: Option<usize>,
     ) -> SolariResponse {
+        let query_start = std::time::Instant::now();
         let is_backward = end_at.is_some();
 
+        let t0 = std::time::Instant::now();
         let start_stops = self.nearest_stops(
             start_location,
             max_candidate_stops_each_side,
@@ -154,6 +161,7 @@ impl<'a, T: Timetable<'a>> Router<'a, T> {
             max_candidate_stops_each_side,
             max_distance_meters,
         );
+        info!(nearest_stops_ms = t0.elapsed().as_millis() as u64, "phase: nearest_stops");
 
         info!(
             start_lat = start_location.lat.deg(),
@@ -208,6 +216,7 @@ impl<'a, T: Timetable<'a>> Router<'a, T> {
                 marked_routes: Vec::new(),
                 timetable: &self.timetable,
                 targets: start_costs.clone(),
+                best_target_time: None,
                 max_steps,
                 max_step_delta,
                 step_log: vec![InternalStep {
@@ -280,6 +289,7 @@ impl<'a, T: Timetable<'a>> Router<'a, T> {
                 marked_routes: Vec::new(),
                 timetable: &self.timetable,
                 targets: target_costs.clone(),
+                best_target_time: None,
                 max_steps,
                 max_step_delta,
                 step_log: vec![InternalStep {
@@ -442,8 +452,7 @@ impl<'a, T: Timetable<'a>> Router<'a, T> {
         } else {
             panic!("First step is not a Begin step.");
         };
-        let transfer_graph = self.transfer_graph.clone();
-        let mut search_context = TransferGraphSearcher::new(transfer_graph);
+        let mut search_context = self.transfer_graph.as_ref().map(|tg| TransferGraphSearcher::new(tg.clone()));
         let legs = steps
             .iter()
             .rev()
@@ -472,27 +481,27 @@ impl<'a, T: Timetable<'a>> Router<'a, T> {
                     route_shape: trip.shape.clone(),
                 }),
                 Step::Transfer(transfer) => {
-                    let from_coord = Coord {
-                        y: transfer.from_stop_latlng[0],
-                        x: transfer.from_stop_latlng[1],
-                    };
-                    let to_coord = Coord {
-                        y: transfer.to_stop_latlng[0],
-                        x: transfer.to_stop_latlng[1],
-                    };
-                    let transfer_shape = match self.transfer_graph.transfer_path(
-                        &mut search_context,
-                        &from_coord,
-                        &to_coord,
-                    ) {
-                        Ok(transfer_path) => Some(transfer_path.shape),
-                        Err(err) => {
-                            error!(
-                                "Failed to calculate transfer path: {}, step: {:?}",
-                                err, transfer
-                            );
-                            None
+                    let transfer_shape = if let (Some(tg), Some(sc)) = (&self.transfer_graph, &mut search_context) {
+                        let from_coord = Coord {
+                            y: transfer.from_stop_latlng[0],
+                            x: transfer.from_stop_latlng[1],
+                        };
+                        let to_coord = Coord {
+                            y: transfer.to_stop_latlng[0],
+                            x: transfer.to_stop_latlng[1],
+                        };
+                        match tg.transfer_path(sc, &from_coord, &to_coord) {
+                            Ok(transfer_path) => Some(transfer_path.shape),
+                            Err(err) => {
+                                error!(
+                                    "Failed to calculate transfer path: {}, step: {:?}",
+                                    err, transfer
+                                );
+                                None
+                            }
                         }
+                    } else {
+                        None
                     };
                     Some(SolariLeg::Transfer {
                         start_time: OffsetDateTime::from_unix_timestamp(
@@ -726,8 +735,7 @@ impl<'a, T: Timetable<'a>> Router<'a, T> {
         // toward the target (where we initialized). So raw_steps goes
         // origin → target. We want that order for legs.
 
-        let transfer_graph = self.transfer_graph.clone();
-        let mut search_context = TransferGraphSearcher::new(transfer_graph);
+        let mut search_context = self.transfer_graph.as_ref().map(|tg| TransferGraphSearcher::new(tg.clone()));
 
         // Build legs. In backward RAPTOR, step.from is the alight stop
         // (closer to target) and step.to is the board stop (closer to origin).
@@ -789,18 +797,18 @@ impl<'a, T: Timetable<'a>> Router<'a, T> {
                 let from_loc = from_stop.location();
                 let to_loc = to_stop.location();
 
-                let from_coord = Coord { y: from_loc.lat.deg(), x: from_loc.lng.deg() };
-                let to_coord = Coord { y: to_loc.lat.deg(), x: to_loc.lng.deg() };
-                let transfer_shape = match self.transfer_graph.transfer_path(
-                    &mut search_context,
-                    &from_coord,
-                    &to_coord,
-                ) {
-                    Ok(path) => Some(path.shape),
-                    Err(err) => {
-                        error!("Failed to calculate transfer path: {}", err);
-                        None
+                let transfer_shape = if let (Some(tg), Some(sc)) = (&self.transfer_graph, &mut search_context) {
+                    let from_coord = Coord { y: from_loc.lat.deg(), x: from_loc.lng.deg() };
+                    let to_coord = Coord { y: to_loc.lat.deg(), x: to_loc.lng.deg() };
+                    match tg.transfer_path(sc, &from_coord, &to_coord) {
+                        Ok(path) => Some(path.shape),
+                        Err(err) => {
+                            error!("Failed to calculate transfer path: {}", err);
+                            None
+                        }
                     }
+                } else {
+                    None
                 };
 
                 legs.push(SolariLeg::Transfer {
@@ -1058,6 +1066,9 @@ pub struct RouterContext<'a, T: Timetable<'a>> {
     marked_routes: Vec<RefCell<Vec<TripStopTime>>>,
     timetable: &'a T,
     targets: Vec<(usize, u32)>,
+    /// Best known arrival time at any target stop. Used for target pruning:
+    /// stops with arrival time >= this are not worth exploring.
+    best_target_time: Option<Time>,
     max_steps: Option<usize>,
     max_step_delta: Option<usize>,
     step_log: Vec<InternalStep<'a>>,
@@ -1105,6 +1116,14 @@ where
         let mut marked = false;
         let mut step_log_idx = None;
         if let InternalStepLocation::Stop(stop) = to {
+            // Target pruning (RAPTOR paper Algorithm 1, line 18):
+            // Don't bother exploring stops we reach later than the best
+            // known arrival at any target stop.
+            if let Some(best_target) = &self.best_target_time {
+                if &arrival_time >= best_target {
+                    return false;
+                }
+            }
             for best_times in &mut self.best_times_per_round.iter_mut().skip(round as usize) {
                 let is_best = if let Some(previous_best) = &best_times[stop.id()] {
                     let fastest = &arrival_time < &previous_best.final_time;
@@ -1151,6 +1170,16 @@ where
             }
             if marked {
                 self.marked_stops[round as usize][stop.id()] = StopMark::Marked;
+                // Update best target time if this stop is a target.
+                if self.targets.iter().any(|(id, _)| *id == stop.id()) {
+                    let should_update = match &self.best_target_time {
+                        Some(current_best) => &arrival_time < current_best,
+                        None => true,
+                    };
+                    if should_update {
+                        self.best_target_time = Some(arrival_time.clone());
+                    }
+                }
             }
         }
         marked

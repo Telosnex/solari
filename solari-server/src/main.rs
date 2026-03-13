@@ -162,6 +162,9 @@ struct ServeArgs {
     valhalla_tile_path: Option<PathBuf>,
     #[arg(short, long)]
     port: Option<u16>,
+    /// Skip loading the transfer graph (305 GB). Walk leg shapes will be omitted.
+    #[arg(long, default_value_t = false)]
+    skip_transfer_graph: bool,
 }
 
 #[launch]
@@ -170,9 +173,14 @@ fn rocket() -> _ {
         .expect("setting tracing default failed");
 
     let args = ServeArgs::parse();
+    let transfer_graph_path = if args.skip_transfer_graph {
+        None
+    } else {
+        Some(args.valhalla_tile_path.unwrap_or(args.base_path.clone()))
+    };
     let router = Router::new(
         MmapTimetable::open(&args.base_path).expect("Failed to open timetable"),
-        args.valhalla_tile_path.unwrap_or(args.base_path),
+        transfer_graph_path,
     )
     .expect("Failed to build router");
 
