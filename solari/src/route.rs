@@ -1325,18 +1325,20 @@ where
             let mut marked_stops_count = 0usize;
             {
                 let total_routes_in_timetable = self.timetable.routes().len();
+                // Only collect active routes (not all 1.3M!)
                 let mut marked_routes: Vec<(usize, TripStopTime)> = self.marked_routes
                     [round as usize]
                     .borrow()
                     .iter()
                     .cloned()
                     .enumerate()
+                    .filter(|(_, tst)| tst.trip_index != usize::MAX)
                     .collect();
                 // Sort the marked routes for deterministic ordering.
                 marked_routes.sort_by_key(|(_, trip_stop_time)| trip_stop_time.route_stop_seq);
                 // Drop mutability.
+                let active_route_count = marked_routes.len();
                 let marked_routes = marked_routes;
-                let active_route_count = marked_routes.iter().filter(|(_, tst)| tst.trip_index != usize::MAX).count();
                 let collect_elapsed = collect_start.elapsed();
 
                 info!(
@@ -1363,9 +1365,6 @@ where
                 let mut total_earliest_trip_calls = 0usize;
 
                 for (route_id, departure) in marked_routes {
-                    if departure.trip_index == usize::MAX {
-                        continue;
-                    }
                     let route = self.timetable.route(route_id);
                     let route_stops_on_route = route.route_stops(self.timetable).len();
                     let mut current_trip: Option<(Trip, RouteStop)> = None;
@@ -1563,44 +1562,58 @@ where
             let route = stop_route.route(timetable);
             stats.stop_routes_examined += 1;
             if marked_routes[route.id()].trip_index == usize::MAX {
-                // First time seeing this route — linear scan forward
+                // First time seeing this route — binary search for earliest valid trip
                 stats.routes_first_seen += 1;
-                let total_trips = route.route_trips(timetable).len();
-                let mut trips_scanned = 0usize;
-                for trip in route.route_trips(timetable) {
-                    trips_scanned += 1;
+                let trips = route.route_trips(timetable);
+                let total_trips = trips.len();
+                // Binary search: find first trip with departure >= not_before at this stop
+                let position = match trips.binary_search_by_key(not_before, |trip| {
+                    trip.stop_times(timetable)[stop_route.stop_seq()].departure()
+                }) {
+                    Ok(pos) => pos,
+                    Err(pos) => pos,
+                };
+                let trips_scanned = if total_trips > 0 {
+                    // binary search touches ~log2(total_trips) entries
+                    (total_trips as f64).log2().ceil() as usize + 1
+                } else {
+                    0
+                };
+                if position < trips.len() {
+                    let trip = &trips[position];
                     let trip_stop_time = &trip.stop_times(timetable)[stop_route.stop_seq()];
-                    if &trip_stop_time.departure() < &not_before {
-                        continue;
-                    }
-
                     if trip_stop_time.departure() < marked_routes[route.id()].departure()
                         || (trip_stop_time.departure() == marked_routes[route.id()].departure()
                             && trip_stop_time.route_stop_seq
                                 > marked_routes[route.id()].route_stop_seq)
                     {
                         marked_routes[route.id()] = *trip_stop_time;
-                        break;
                     }
                 }
                 stats.trips_scanned_first_seen += trips_scanned;
                 stats.trips_total_on_first_seen_routes += total_trips;
                 stats.max_trips_scanned_single_route = stats.max_trips_scanned_single_route.max(trips_scanned);
             } else {
-                // Route already seen — reverse scan
+                // Route already seen — binary search for earliest trip >= not_before,
+                // but only among trips up to the currently marked one.
                 stats.routes_already_seen += 1;
-                let mut trips_scanned = 0usize;
-                for trip in route.route_trips(timetable)
-                    [0..=(marked_routes[route.id()].trip_index - route.first_route_trip)]
-                    .iter()
-                    .rev()
-                {
-                    trips_scanned += 1;
+                let trips = route.route_trips(timetable);
+                let upper = marked_routes[route.id()].trip_index - route.first_route_trip;
+                let search_slice = &trips[0..=upper];
+                let position = match search_slice.binary_search_by_key(not_before, |trip| {
+                    trip.stop_times(timetable)[stop_route.stop_seq()].departure()
+                }) {
+                    Ok(pos) => pos,
+                    Err(pos) => pos,
+                };
+                let trips_scanned = if search_slice.len() > 0 {
+                    (search_slice.len() as f64).log2().ceil() as usize + 1
+                } else {
+                    0
+                };
+                if position < search_slice.len() {
+                    let trip = &search_slice[position];
                     let trip_stop_time = &trip.stop_times(timetable)[stop_route.stop_seq()];
-                    if &trip_stop_time.departure() < &not_before {
-                        break;
-                    }
-
                     if trip_stop_time.departure() < marked_routes[route.id()].departure()
                         || (trip_stop_time.departure() == marked_routes[route.id()].departure()
                             && trip_stop_time.route_stop_seq
