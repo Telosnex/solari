@@ -1009,6 +1009,9 @@ struct ExploreRoutesStats {
     stop_routes_examined: usize,
     routes_first_seen: usize,
     routes_already_seen: usize,
+    already_seen_fifo_skipped: usize,
+    already_seen_2probe_resolved: usize,
+    already_seen_full_bsearch: usize,
     trips_scanned_first_seen: usize,
     trips_total_on_first_seen_routes: usize,
     trips_scanned_already_seen: usize,
@@ -1355,6 +1358,9 @@ where
                     trips_scanned_first_seen = explore_stats.trips_scanned_first_seen,
                     trips_total_on_first_seen = explore_stats.trips_total_on_first_seen_routes,
                     trips_scanned_already_seen = explore_stats.trips_scanned_already_seen,
+                    already_seen_fifo_skipped = explore_stats.already_seen_fifo_skipped,
+                    already_seen_2probe_resolved = explore_stats.already_seen_2probe_resolved,
+                    already_seen_full_bsearch = explore_stats.already_seen_full_bsearch,
                     max_trips_scanned_single_route = explore_stats.max_trips_scanned_single_route,
                     "round: explore_routes_for_marked_stop summary"
                 );
@@ -1594,26 +1600,30 @@ where
                 stats.trips_total_on_first_seen_routes += total_trips;
                 stats.max_trips_scanned_single_route = stats.max_trips_scanned_single_route.max(trips_scanned);
             } else {
-                // Route already seen — binary search for earliest trip >= not_before,
-                // but only among trips up to the currently marked one.
+                // Route already seen — FIFO shortcut + 2-probe + binary search fallback
                 stats.routes_already_seen += 1;
                 let trips = route.route_trips(timetable);
                 let upper = marked_routes[route.id()].trip_index - route.first_route_trip;
-                let search_slice = &trips[0..=upper];
-                let position = match search_slice.binary_search_by_key(not_before, |trip| {
-                    trip.stop_times(timetable)[stop_route.stop_seq()].departure()
-                }) {
-                    Ok(pos) => pos,
-                    Err(pos) => pos,
-                };
-                let trips_scanned = if search_slice.len() > 0 {
-                    (search_slice.len() as f64).log2().ceil() as usize + 1
-                } else {
-                    0
-                };
-                if position < search_slice.len() {
-                    let trip = &search_slice[position];
-                    let trip_stop_time = &trip.stop_times(timetable)[stop_route.stop_seq()];
+
+                // FIFO shortcut: trip[upper] is the latest trip we'd consider.
+                // If it departs before not_before at this stop, all earlier
+                // trips do too (FIFO). No trip boardable here. 1 mmap read.
+                let upper_dep = trips[upper].stop_times(timetable)[stop_route.stop_seq()].departure();
+                if &upper_dep < not_before {
+                    stats.already_seen_fifo_skipped += 1;
+                    stats.trips_scanned_already_seen += 1;
+                    continue;
+                }
+
+                // trip[upper] IS boardable. 2-probe check: is it the earliest?
+                if upper == 0 || {
+                    let prev_dep = trips[upper - 1].stop_times(timetable)[stop_route.stop_seq()].departure();
+                    &prev_dep < not_before
+                } {
+                    // trip[upper] is the earliest boardable at this stop. 2 reads total.
+                    stats.already_seen_2probe_resolved += 1;
+                    stats.trips_scanned_already_seen += 2;
+                    let trip_stop_time = &trips[upper].stop_times(timetable)[stop_route.stop_seq()];
                     if trip_stop_time.departure() < marked_routes[route.id()].departure()
                         || (trip_stop_time.departure() == marked_routes[route.id()].departure()
                             && trip_stop_time.route_stop_seq
@@ -1621,8 +1631,30 @@ where
                     {
                         marked_routes[route.id()] = *trip_stop_time;
                     }
+                } else {
+                    // Full binary search needed.
+                    stats.already_seen_full_bsearch += 1;
+                    let search_slice = &trips[0..=upper];
+                    let position = match search_slice.binary_search_by_key(not_before, |trip| {
+                        trip.stop_times(timetable)[stop_route.stop_seq()].departure()
+                    }) {
+                        Ok(pos) => pos,
+                        Err(pos) => pos,
+                    };
+                    let trips_scanned = (search_slice.len() as f64).log2().ceil() as usize + 3; // +2 for FIFO/2-probe, +1 for result read
+                    if position < search_slice.len() {
+                        let trip = &search_slice[position];
+                        let trip_stop_time = &trip.stop_times(timetable)[stop_route.stop_seq()];
+                        if trip_stop_time.departure() < marked_routes[route.id()].departure()
+                            || (trip_stop_time.departure() == marked_routes[route.id()].departure()
+                                && trip_stop_time.route_stop_seq
+                                    > marked_routes[route.id()].route_stop_seq)
+                        {
+                            marked_routes[route.id()] = *trip_stop_time;
+                        }
+                    }
+                    stats.trips_scanned_already_seen += trips_scanned;
                 }
-                stats.trips_scanned_already_seen += trips_scanned;
             }
         }
     }
