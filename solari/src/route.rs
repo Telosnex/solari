@@ -1004,6 +1004,17 @@ struct InternalItinerary {
     final_time: Time,
 }
 
+#[derive(Debug, Clone, Default)]
+struct ExploreRoutesStats {
+    stop_routes_examined: usize,
+    routes_first_seen: usize,
+    routes_already_seen: usize,
+    trips_scanned_first_seen: usize,
+    trips_total_on_first_seen_routes: usize,
+    trips_scanned_already_seen: usize,
+    max_trips_scanned_single_route: usize,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum StopMark {
     Unmarked,
@@ -1277,7 +1288,12 @@ where
                     self.timetable.routes().len()
                 ]));
             }
+            let alloc_elapsed = round_start.elapsed();
+
             // Mark routes based on stops that were marked in the previous round.
+            let explore_start = std::time::Instant::now();
+            let mut input_marked_stops = 0usize;
+            let mut explore_stats = ExploreRoutesStats::default();
             {
                 let mut new_marked_routes = self.marked_routes[round as usize].borrow_mut();
                 for val in &mut (*new_marked_routes) {
@@ -1289,6 +1305,7 @@ where
                     if *stop_marked != StopMark::Marked {
                         continue;
                     }
+                    input_marked_stops += 1;
                     *stop_marked = StopMark::MarkedForTransfersOnly;
                     Self::explore_routes_for_marked_stop(
                         self.timetable,
@@ -1298,12 +1315,16 @@ where
                             .as_ref()
                             .unwrap()
                             .final_time,
+                        &mut explore_stats,
                     );
                 }
             }
+            let explore_elapsed = explore_start.elapsed();
 
+            let collect_start = std::time::Instant::now();
             let mut marked_stops_count = 0usize;
             {
+                let total_routes_in_timetable = self.timetable.routes().len();
                 let mut marked_routes: Vec<(usize, TripStopTime)> = self.marked_routes
                     [round as usize]
                     .borrow()
@@ -1315,17 +1336,44 @@ where
                 marked_routes.sort_by_key(|(_, trip_stop_time)| trip_stop_time.route_stop_seq);
                 // Drop mutability.
                 let marked_routes = marked_routes;
+                let active_route_count = marked_routes.iter().filter(|(_, tst)| tst.trip_index != usize::MAX).count();
+                let collect_elapsed = collect_start.elapsed();
+
+                info!(
+                    round = round,
+                    input_marked_stops = input_marked_stops,
+                    alloc_ms = alloc_elapsed.as_millis() as u64,
+                    explore_ms = explore_elapsed.as_millis() as u64,
+                    collect_sort_ms = collect_elapsed.as_millis() as u64,
+                    total_routes_in_timetable = total_routes_in_timetable,
+                    active_routes = active_route_count,
+                    stop_routes_examined = explore_stats.stop_routes_examined,
+                    routes_first_seen = explore_stats.routes_first_seen,
+                    routes_already_seen = explore_stats.routes_already_seen,
+                    trips_scanned_first_seen = explore_stats.trips_scanned_first_seen,
+                    trips_total_on_first_seen = explore_stats.trips_total_on_first_seen_routes,
+                    trips_scanned_already_seen = explore_stats.trips_scanned_already_seen,
+                    max_trips_scanned_single_route = explore_stats.max_trips_scanned_single_route,
+                    "round: explore_routes_for_marked_stop summary"
+                );
+
+                let scan_start = std::time::Instant::now();
+                let mut total_route_stops_walked = 0usize;
+                let mut total_stop_times_read = 0usize;
+                let mut total_earliest_trip_calls = 0usize;
 
                 for (route_id, departure) in marked_routes {
                     if departure.trip_index == usize::MAX {
                         continue;
                     }
                     let route = self.timetable.route(route_id);
+                    let route_stops_on_route = route.route_stops(self.timetable).len();
                     let mut current_trip: Option<(Trip, RouteStop)> = None;
                     let mut found_first_stop = false;
                     let mut departure_stop_seq = 0usize;
 
                     for route_stop in route.route_stops(self.timetable) {
+                        total_route_stops_walked += 1;
                         if route_stop.id() == departure.route_stop(self.timetable).id() {
                             found_first_stop = true;
                         }
@@ -1334,6 +1382,7 @@ where
                             continue;
                         }
                         if let Some((current_trip, current_trip_start)) = &mut current_trip {
+                            total_stop_times_read += 2; // departure + arrival
                             let departure_trip_stop_time =
                                 &current_trip.stop_times(self.timetable)[departure_stop_seq];
                             let previous_step = if let Some(previous_step) = self
@@ -1367,7 +1416,7 @@ where
                             ) {
                                 marked_stops_count += 1;
                                 
-
+                                total_earliest_trip_calls += 1;
                                 if let Some(trip) = self.earliest_trip_from(
                                     departure.route_stop(self.timetable),
                                     &self.best_times_per_round[round as usize - 1]
@@ -1392,6 +1441,7 @@ where
                         }
 
                         if current_trip.is_none() {
+                            total_earliest_trip_calls += 1;
                             let best_time_at_stop = self.best_times_per_round[round as usize - 1]
                                 [route_stop.stop(self.timetable).id()]
                                 .as_ref()
@@ -1404,8 +1454,19 @@ where
                         }
                     }
                 }
+                let scan_elapsed = scan_start.elapsed();
+                debug!("Marked {} new stops", marked_stops_count);
+
+                info!(
+                    round = round,
+                    scan_ms = scan_elapsed.as_millis() as u64,
+                    total_route_stops_walked = total_route_stops_walked,
+                    total_stop_times_read = total_stop_times_read,
+                    total_earliest_trip_calls = total_earliest_trip_calls,
+                    marked_stops_from_scan = marked_stops_count,
+                    "round: route_scan detail"
+                );
             }
-            debug!("Marked {} new stops", marked_stops_count);
             let route_scan_elapsed = round_start.elapsed();
             marked_stops_total += marked_stops_count;
 
@@ -1496,49 +1557,59 @@ where
         marked_routes: &mut [TripStopTime],
         marked_stop: &Stop,
         not_before: &Time,
+        stats: &mut ExploreRoutesStats,
     ) {
         for stop_route in marked_stop.stop_routes(timetable) {
             let route = stop_route.route(timetable);
+            stats.stop_routes_examined += 1;
             if marked_routes[route.id()].trip_index == usize::MAX {
+                // First time seeing this route — linear scan forward
+                stats.routes_first_seen += 1;
+                let total_trips = route.route_trips(timetable).len();
+                let mut trips_scanned = 0usize;
                 for trip in route.route_trips(timetable) {
+                    trips_scanned += 1;
                     let trip_stop_time = &trip.stop_times(timetable)[stop_route.stop_seq()];
                     if &trip_stop_time.departure() < &not_before {
                         continue;
                     }
 
-                    // The clause after the && here is included for determinism. It specifies that we will prefer getting onto a vehicle later rather than earlier if we can do so at multiple locations.
                     if trip_stop_time.departure() < marked_routes[route.id()].departure()
                         || (trip_stop_time.departure() == marked_routes[route.id()].departure()
                             && trip_stop_time.route_stop_seq
                                 > marked_routes[route.id()].route_stop_seq)
                     {
                         marked_routes[route.id()] = *trip_stop_time;
-                        // Any trips after this one do not need to be examined.
                         break;
                     }
                 }
+                stats.trips_scanned_first_seen += trips_scanned;
+                stats.trips_total_on_first_seen_routes += total_trips;
+                stats.max_trips_scanned_single_route = stats.max_trips_scanned_single_route.max(trips_scanned);
             } else {
+                // Route already seen — reverse scan
+                stats.routes_already_seen += 1;
+                let mut trips_scanned = 0usize;
                 for trip in route.route_trips(timetable)
                     [0..=(marked_routes[route.id()].trip_index - route.first_route_trip)]
                     .iter()
                     .rev()
                 {
+                    trips_scanned += 1;
                     let trip_stop_time = &trip.stop_times(timetable)[stop_route.stop_seq()];
                     if &trip_stop_time.departure() < &not_before {
-                        // We are iterating in reverse, so nothing "after" this (before, temporally) needs to be examined.
                         break;
                     }
 
-                    // The clause after the && here is included for determinism. It specifies that we will prefer getting onto a vehicle later rather than earlier if we can do so at multiple locations.
                     if trip_stop_time.departure() < marked_routes[route.id()].departure()
                         || (trip_stop_time.departure() == marked_routes[route.id()].departure()
                             && trip_stop_time.route_stop_seq
                                 > marked_routes[route.id()].route_stop_seq)
                     {
                         marked_routes[route.id()] = *trip_stop_time;
-                        // We are iterating in reverse, so we can't break here.
                     }
                 }
+                stats.trips_scanned_already_seen += trips_scanned;
             }
         }
     }
